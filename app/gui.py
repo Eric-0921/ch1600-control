@@ -26,9 +26,10 @@ from PyQt5.QtWidgets import (
 )
 
 from data.circular_buffer import CircularBuffer
+from data.recorder import CH1600Recorder
 from core.command_service import CommandService
 from core.commands import Command, CommandType
-from app.config_io import load_config, save_config
+from app.config_io import ACQ_MODE_TABLE, load_config, save_config
 
 try:
     import pyqtgraph as pg
@@ -190,9 +191,13 @@ class GaussMeterGUI(QMainWindow):
         )
 
         # 记录
-        self._recording = False
-        self._record_file: Optional[Path] = None
-        self._record_handle = None
+        self._recorder: Optional[CH1600Recorder] = None
+
+        # 软件零点偏移 (仅主线程读写, 无需加锁)
+        self._zero_offset: float = self._cfg.get("acquisition", {}).get("zero_offset", 0.0)
+
+        # 显示暂停
+        self._display_paused = False
 
         # FPS 跟踪
         self._display_fps = 0.0
@@ -214,6 +219,13 @@ class GaussMeterGUI(QMainWindow):
 
         # 初始化全局状态栏
         self._update_global_bar(False, False)
+
+        # 恢复保存的采集模式
+        saved_mode = self._cfg.get("acquisition", {}).get("mode_key", "dc_normal")
+        idx = self._sample_rate_combo.findData(saved_mode)
+        if idx >= 0:
+            self._sample_rate_combo.setCurrentIndex(idx)
+        self._on_acq_mode_changed()
 
         self.log("[GUI] CH-1600 高斯计控制程序已启动")
 
@@ -248,8 +260,7 @@ class GaussMeterGUI(QMainWindow):
             ("连接 / Connection", 0),
             ("参数设置 / Parameters", 1),
             ("实时数据 / Live Data", 2),
-            ("数据记录 / Recording", 3),
-            ("日志 / Log", 4),
+            ("日志 / Log", 3),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -261,7 +272,6 @@ class GaussMeterGUI(QMainWindow):
         self._pages.addWidget(self._build_connection_page())
         self._pages.addWidget(self._build_param_page())
         self._pages.addWidget(self._build_live_data_page())
-        self._pages.addWidget(self._build_recording_page())
         self._pages.addWidget(self._build_log_page())
 
         splitter.addWidget(self._nav_tree)
@@ -341,14 +351,16 @@ class GaussMeterGUI(QMainWindow):
         self._stream_led.style().unpolish(self._stream_led)
         self._stream_led.style().polish(self._stream_led)
 
-        self._rec_led.setProperty("on", "true" if self._recording else "false")
+        self._rec_led.setProperty("on", "true" if (self._recorder and self._recorder.is_recording) else "false")
         self._rec_led.style().unpolish(self._rec_led)
         self._rec_led.style().polish(self._rec_led)
 
         if connected:
             unit = self._ctrl.driver.cached_unit if self._ctrl else "?"
             rng = self._ctrl.driver.cached_range if self._ctrl else "?"
-            self._global_info.setText(f"{unit} | {rng}")
+            mode = self._get_active_acq_mode()
+            short_label = mode["label"].split("(")[0].strip()
+            self._global_info.setText(f"{unit} | {rng} | {short_label}")
         else:
             self._global_info.setText("未连接")
 
@@ -427,7 +439,70 @@ class GaussMeterGUI(QMainWindow):
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
 
-        # 单位和量程
+        # ── 采集模式 ──
+        acq_grp = QGroupBox("采集模式 / Acquisition Mode")
+        ag = QGridLayout(acq_grp)
+
+        ag.addWidget(QLabel("测量类型 / Meas. Type:"), 0, 0)
+        self._meas_type_combo = QComboBox()
+        self._meas_type_combo.addItems([
+            "DC 直流 (默认)",
+            "AC 低频 / ACL",
+            "AC 中高频 / ACH",
+        ])
+        self._meas_type_combo.currentIndexChanged.connect(self._on_acq_mode_changed)
+        ag.addWidget(self._meas_type_combo, 0, 1)
+
+        ag.addWidget(QLabel("采集速率 / Sample Rate:"), 1, 0)
+        self._sample_rate_combo = QComboBox()
+        # 按 ACQ_MODE_TABLE 的 key 顺序
+        self._rate_keys = ["dc_normal", "dc_20hz", "dc_50hz", "dc_100hz",
+                           "dc_200hz", "dc_200plus",
+                           "ac_20hz", "ac_50hz", "ac_100hz", "ac_200hz"]
+        for k in self._rate_keys:
+            self._sample_rate_combo.addItem(ACQ_MODE_TABLE[k]["label"], k)
+        self._sample_rate_combo.currentIndexChanged.connect(self._on_acq_mode_changed)
+        ag.addWidget(self._sample_rate_combo, 1, 1)
+
+        # 模式信息
+        self._acq_info_label = QLabel()
+        self._acq_info_label.setObjectName("smallData")
+        self._acq_info_label.setWordWrap(True)
+        ag.addWidget(self._acq_info_label, 2, 0, 1, 2)
+
+        layout.addWidget(acq_grp)
+
+        # ── 设备面板操作引导 ──
+        guide_grp = QGroupBox("设备面板操作引导 / Device Panel Guide")
+        guide_grp.setCheckable(True)
+        guide_grp.setChecked(False)
+        gv = QVBoxLayout(guide_grp)
+
+        guide_text = QLabel(
+            "<b>⚠ 以下参数仅可通过 CH-1600 前面板设置，RS-232 协议不支持远程控制。</b><br>"
+            "<br>"
+            "<b>▶ AC/DC 模式切换：</b><br>"
+            "  按前面板 <b>[AC/DC]</b> 键循环切换：<br>"
+            "  &nbsp;&nbsp;DC 直流 → AC 低频 (ACL) → AC 中高频 (ACH) → DC ...<br>"
+            "  <i>切换后请在上方手动同步选择对应模式。</i><br>"
+            "<br>"
+            "<b>▶ 采集速率调节：</b><br>"
+            "  按前面板 <b>[Menu]</b> 键进入菜单 → 找到采集速度选项 →<br>"
+            "  &nbsp;&nbsp;用 ▲▼ 键选择目标速率 → 按 Enter 确认 → 选择 Exit 退出。<br>"
+            "  <i>出厂默认：常速 (~4-10 Hz, 最高精度 ±0.00001 mT)。</i><br>"
+            "  <i>速率越高精度越低，详见说明书表 4-2。</i><br>"
+            "<br>"
+            "<b>▶ 实时发送 (Realtime Transmit) 模式：</b><br>"
+            "  按 <b>[Menu]</b> → 选择 <b>Realtime Transmit</b> → 按 Enter →<br>"
+            "  设备开始持续串口发送数据帧，此时 <b>RS-232 指令不可用</b>。<br>"
+            "  <i>要恢复指令控制：在设备面板按 Enter 退出实时发送模式。</i>"
+        )
+        guide_text.setWordWrap(True)
+        guide_text.setStyleSheet("font-size: 11px; color: #555;")
+        gv.addWidget(guide_text)
+        layout.addWidget(guide_grp)
+
+        # ── 单位和量程 ──
         grp1 = QGroupBox("单位和量程 / Unit & Range")
         g1 = QGridLayout(grp1)
 
@@ -527,15 +602,21 @@ class GaussMeterGUI(QMainWindow):
         self._field_label = QLabel("0.0000 mT")
         self._field_label.setObjectName("bigData")
         self._field_label.setAlignment(Qt.AlignCenter)
+        self._field_label.setMinimumWidth(180)
         field_box.addWidget(self._field_label)
         num_row.addLayout(field_box)
 
         # 频率
         freq_box = QVBoxLayout()
-        freq_box.addWidget(QLabel("频率 / Frequency"))
-        self._freq_label = QLabel("0 Hz")
+        freq_label_title = QLabel("频率 / Frequency")
+        freq_box.addWidget(freq_label_title)
+        self._freq_label = QLabel("DC")
         self._freq_label.setObjectName("smallData")
         self._freq_label.setAlignment(Qt.AlignCenter)
+        self._freq_label.setMinimumWidth(120)
+        self._freq_label.setToolTip(
+            "DC 模式下频率恒为 0，需按设备面板 [AC/DC] 键切换到 ACL/ACH 模式才能测量交流频率"
+        )
         freq_box.addWidget(self._freq_label)
         num_row.addLayout(freq_box)
 
@@ -545,12 +626,13 @@ class GaussMeterGUI(QMainWindow):
         self._temp_label = QLabel("0.0 °C")
         self._temp_label.setObjectName("smallData")
         self._temp_label.setAlignment(Qt.AlignCenter)
+        self._temp_label.setMinimumWidth(120)
         temp_box.addWidget(self._temp_label)
         num_row.addLayout(temp_box)
 
         layout.addLayout(num_row)
 
-        # 流控制按钮
+        # 流控制按钮行 1: 采集 + 归零
         ctrl_row = QHBoxLayout()
 
         self._stream_start_btn = QPushButton("开始采集 / Start Acquisition")
@@ -570,6 +652,23 @@ class GaussMeterGUI(QMainWindow):
         self._zero_btn2.setEnabled(False)
         ctrl_row.addWidget(self._zero_btn2)
 
+        ctrl_row.addSpacing(16)
+
+        # 软件零点偏移
+        self._set_zero_btn = QPushButton("软件归零 / Set Zero")
+        self._set_zero_btn.clicked.connect(self._on_set_zero)
+        self._set_zero_btn.setEnabled(False)
+        ctrl_row.addWidget(self._set_zero_btn)
+
+        self._clear_zero_btn = QPushButton("清除归零 / Clear Zero")
+        self._clear_zero_btn.clicked.connect(self._on_clear_zero)
+        self._clear_zero_btn.setEnabled(False)
+        ctrl_row.addWidget(self._clear_zero_btn)
+
+        self._zero_offset_label = QLabel("Zero offset: 0.0000 mT")
+        self._zero_offset_label.setObjectName("smallData")
+        ctrl_row.addWidget(self._zero_offset_label)
+
         ctrl_row.addStretch()
 
         # 统计
@@ -585,6 +684,7 @@ class GaussMeterGUI(QMainWindow):
             self._plot_widget.setLabel("bottom", "时间", units="s")
             self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
             self._plot_widget.addLegend()
+            self._plot_widget.setMinimumHeight(200)
 
             # 性能优化
             self._plot_widget.setClipToView(True)
@@ -611,7 +711,7 @@ class GaussMeterGUI(QMainWindow):
             no_plot.setAlignment(Qt.AlignCenter)
             layout.addWidget(no_plot)
 
-        # 复选框: 显示频率曲线
+        # 复选框行
         chk_row = QHBoxLayout()
         self._show_freq_cb = QCheckBox("显示频率曲线 / Show Frequency")
         self._show_freq_cb.toggled.connect(self._on_toggle_freq_curve)
@@ -624,66 +724,69 @@ class GaussMeterGUI(QMainWindow):
         chk_row.addStretch()
         layout.addLayout(chk_row)
 
-        return page
+        # 图表控制按钮行 (清除 / 暂停 / 保存)
+        chart_btn_row = QHBoxLayout()
 
-    # ==================================================================
-    # 页面 3: 数据记录
-    # ==================================================================
+        clear_chart_btn = QPushButton("清除图表 / Clear Chart")
+        clear_chart_btn.clicked.connect(self._on_clear_chart)
+        chart_btn_row.addWidget(clear_chart_btn)
 
-    def _build_recording_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 16)
+        self._pause_btn = QPushButton("暂停显示 / Pause")
+        self._pause_btn.setCheckable(True)
+        self._pause_btn.clicked.connect(self._on_pause_display)
+        chart_btn_row.addWidget(self._pause_btn)
 
-        title = QLabel("数据记录 / Recording")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
+        save_chart_btn = QPushButton("保存图表 / Save Chart")
+        save_chart_btn.clicked.connect(self._on_save_chart)
+        chart_btn_row.addWidget(save_chart_btn)
 
-        # 保存目录
-        grp1 = QGroupBox("保存设置 / Save Settings")
-        g1 = QHBoxLayout(grp1)
-        g1.addWidget(QLabel("目录 / Directory:"))
+        chart_btn_row.addStretch()
+        layout.addLayout(chart_btn_row)
+
+        # ── 数据记录组 (可折叠) ──
+        rec_grp = QGroupBox("数据记录 / Recording")
+        rec_grp.setCheckable(True)
+        rec_grp.setChecked(False)
+        rv = QVBoxLayout(rec_grp)
+
+        # 保存目录选择
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("目录 / Directory:"))
         self._save_dir_edit = QLineEdit(
             self._cfg.get("acquisition", {}).get("save_dir", "./experiments")
         )
-        g1.addWidget(self._save_dir_edit)
-
+        dir_row.addWidget(self._save_dir_edit)
         browse_btn = QPushButton("浏览 / Browse")
         browse_btn.clicked.connect(self._on_browse_save_dir)
-        g1.addWidget(browse_btn)
-        layout.addWidget(grp1)
+        dir_row.addWidget(browse_btn)
+        rv.addLayout(dir_row)
 
-        # 记录控制
-        grp2 = QGroupBox("记录控制 / Recording Control")
-        g2 = QHBoxLayout(grp2)
-
+        # 记录控制按钮
+        rec_ctrl_row = QHBoxLayout()
         self._rec_start_btn = QPushButton("开始记录 / Start Recording")
         self._rec_start_btn.setObjectName("successBtn")
         self._rec_start_btn.clicked.connect(self._on_start_recording)
         self._rec_start_btn.setEnabled(False)
-        g2.addWidget(self._rec_start_btn)
+        rec_ctrl_row.addWidget(self._rec_start_btn)
 
         self._rec_stop_btn = QPushButton("停止记录 / Stop Recording")
         self._rec_stop_btn.setObjectName("dangerBtn")
         self._rec_stop_btn.clicked.connect(self._on_stop_recording)
         self._rec_stop_btn.setEnabled(False)
-        g2.addWidget(self._rec_stop_btn)
-
-        g2.addStretch()
-        layout.addWidget(grp2)
+        rec_ctrl_row.addWidget(self._rec_stop_btn)
+        rec_ctrl_row.addStretch()
+        rv.addLayout(rec_ctrl_row)
 
         # 记录统计
-        grp3 = QGroupBox("记录统计 / Recording Stats")
-        g3 = QVBoxLayout(grp3)
         self._rec_stats_label = QLabel("未记录 / Not Recording")
-        g3.addWidget(self._rec_stats_label)
-        layout.addWidget(grp3)
+        rv.addWidget(self._rec_stats_label)
 
-        layout.addStretch()
+        layout.addWidget(rec_grp)
+
         return page
 
     # ==================================================================
-    # 页面 4: 日志
+    # 页面 3: 日志
     # ==================================================================
 
     def _build_log_page(self) -> QWidget:
@@ -697,7 +800,8 @@ class GaussMeterGUI(QMainWindow):
 
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
-        layout.addWidget(self._log_text)
+        self._log_text.setMinimumHeight(100)
+        layout.addWidget(self._log_text, 1)
 
         # 清除按钮
         clear_btn = QPushButton("清除 / Clear")
@@ -754,7 +858,17 @@ class GaussMeterGUI(QMainWindow):
             self._conn_info_label.setText(f"已连接 / Connected\n{idn}")
             self._connect_btn.setEnabled(False)
             self._disconnect_btn.setEnabled(True)
-            self._update_connected_ui(True)
+
+            # 检测面板实时发送模式
+            if self._ctrl and self._ctrl.driver.is_panel_streaming_mode:
+                self._update_connected_ui(False)  # 禁用指令按钮
+                self._stream_start_btn.setEnabled(True)  # 但可以开始采集
+                self.log("[GUI] 设备处于面板实时发送模式 — RS-232 指令不可用")
+                self.log("[GUI] 要使用完整功能, 请在设备面板按 Enter 退出实时发送模式")
+                self._status_label.setText("面板实时发送模式 — 指令不可用 / Panel Streaming — No Commands")
+            else:
+                self._update_connected_ui(True)
+
             self._update_global_bar(True, False)
         except Exception as exc:
             self.log(f"[GUI] 连接失败: {exc}")
@@ -779,6 +893,7 @@ class GaussMeterGUI(QMainWindow):
             self._maxmin_btn, self._lock_btn,
             self._stream_start_btn,
             self._rec_start_btn,
+            self._set_zero_btn, self._clear_zero_btn,
             self._up_thresh_edit, self._set_up_thresh_btn,
             self._low_thresh_edit, self._set_low_thresh_btn,
         ]:
@@ -787,6 +902,34 @@ class GaussMeterGUI(QMainWindow):
     # ==================================================================
     # 参数操作
     # ==================================================================
+
+    def _on_acq_mode_changed(self) -> None:
+        """采集模式变更: 更新图表优化参数 + 模式信息显示。"""
+        rate_key = self._sample_rate_combo.currentData()
+        if rate_key not in ACQ_MODE_TABLE:
+            return
+        mode = ACQ_MODE_TABLE[rate_key]
+
+        # 更新信息标签
+        meas_type = self._meas_type_combo.currentText().split(" ")[0]
+        self._acq_info_label.setText(
+            f"当前: {mode['label']} ({meas_type}) | "
+            f"预期 FPS: {mode['expect_fps']} | 分辨率: {mode['resolution']} | "
+            f"精度: {mode['accuracy']}"
+        )
+
+        # 保存到配置
+        self._cfg.setdefault("acquisition", {})["mode_key"] = rate_key
+        save_config(self._cfg)
+
+        self.log(f"[GUI] 采集模式已切换: {mode['label']}")
+
+    def _get_active_acq_mode(self) -> dict:
+        """获取当前生效的采集模式参数。"""
+        rate_key = self._sample_rate_combo.currentData()
+        if rate_key in ACQ_MODE_TABLE:
+            return ACQ_MODE_TABLE[rate_key]
+        return ACQ_MODE_TABLE["dc_normal"]
 
     def _on_cycle_unit(self) -> None:
         if self._cmd_service:
@@ -840,6 +983,77 @@ class GaussMeterGUI(QMainWindow):
         except ValueError:
             pass
 
+    # ------------------------------------------------------------------
+    # 软件零点偏移校准
+    # ------------------------------------------------------------------
+
+    def _on_set_zero(self) -> None:
+        """以当前读数为零点，后续数据均减去此偏移。"""
+        # 从 buffer 取的是已修正值，需加回当前 offset 得到原始仪器值
+        field_display = self._buffer.get_latest("field_mt")
+        self._zero_offset = field_display + self._zero_offset
+        self._zero_offset_label.setText(f"Zero offset: {self._zero_offset:.4f} mT")
+        self._cfg.setdefault("acquisition", {})["zero_offset"] = self._zero_offset
+        save_config(self._cfg)
+        self.log(f"[GUI] 设置软件零点偏移: {self._zero_offset:.4f} mT")
+
+    def _on_clear_zero(self) -> None:
+        """清除零点偏移，恢复原始读数。"""
+        self._zero_offset = 0.0
+        self._zero_offset_label.setText("Zero offset: 0.0000 mT")
+        self._cfg.setdefault("acquisition", {})["zero_offset"] = 0.0
+        save_config(self._cfg)
+        self.log("[GUI] 已清除软件零点偏移")
+
+    # ------------------------------------------------------------------
+    # 图表控制操作
+    # ------------------------------------------------------------------
+
+    def _on_clear_chart(self) -> None:
+        """清空图表数据和缓冲区。"""
+        self._buffer.clear()
+        self._total_points = 0
+        if hasattr(self, '_field_curve') and self._field_curve is not None:
+            self._field_curve.clear()
+        if hasattr(self, '_freq_curve') and self._freq_curve is not None:
+            self._freq_curve.clear()
+        self.log("[GUI] 图表已清除")
+
+    def _on_pause_display(self, checked: bool) -> None:
+        """暂停/恢复图表显示 (数据采集继续)。"""
+        self._display_paused = checked
+        if checked:
+            self._pause_btn.setText("恢复显示 / Resume")
+            self.log("[GUI] 图表显示已暂停 (数据采集继续)")
+        else:
+            self._pause_btn.setText("暂停显示 / Pause")
+            self.log("[GUI] 图表显示已恢复")
+            # 恢复时立即刷新 Y 轴范围，避免因暂停期间数据变化导致范围过期
+            if self._auto_y_cb.isChecked() and hasattr(self, '_field_curve'):
+                _, vals = self._buffer.get("field_mt", max_points=5000, downsample=1)
+                if len(vals) > 0:
+                    y_min, y_max = vals.min(), vals.max()
+                    margin = max(abs(y_min), abs(y_max)) * 0.1 + 1e-6
+                    self._plot_widget.setYRange(y_min - margin, y_max + margin, padding=0)
+
+    def _on_save_chart(self) -> None:
+        """导出图表为 PNG/SVG/JPG 图片。"""
+        if not _HAS_PYG or self._plot_widget is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存图表", "chart.png",
+            "PNG (*.png);;SVG (*.svg);;JPEG (*.jpg)"
+        )
+        if not path:
+            return
+        try:
+            exporter = pg.exporters.ImageExporter(self._plot_widget.plotItem)
+            exporter.export(path)
+            self.log(f"[GUI] 图表已保存: {path}")
+        except Exception as exc:
+            self.log(f"[GUI] 保存图表失败: {exc}")
+            QMessageBox.critical(self, "保存失败", str(exc))
+
     # ==================================================================
     # 数据流操作
     # ==================================================================
@@ -864,7 +1078,7 @@ class GaussMeterGUI(QMainWindow):
         self.log("[GUI] 数据采集已停止")
 
     # ==================================================================
-    # 数据记录操作
+    # 数据记录操作 (使用 CH1600Recorder)
     # ==================================================================
 
     def _on_browse_save_dir(self) -> None:
@@ -873,30 +1087,32 @@ class GaussMeterGUI(QMainWindow):
             self._save_dir_edit.setText(d)
 
     def _on_start_recording(self) -> None:
+        if not (self._ctrl and self._ctrl.is_streaming):
+            QMessageBox.warning(self, "未在采集", "请先开始数据采集再记录。\nStart acquisition before recording.")
+            return
         save_dir = Path(self._save_dir_edit.text())
-        save_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._record_file = save_dir / f"ch1600_{ts}.csv"
+        self._recorder = CH1600Recorder(output_dir=save_dir)
         try:
-            self._record_handle = open(self._record_file, "w", encoding="utf-8-sig")
-            self._record_handle.write("timestamp_s,field_mt,freq_hz,temp_c\n")
-            self._recording = True
+            file_path = self._recorder.start()
             self._rec_start_btn.setEnabled(False)
             self._rec_stop_btn.setEnabled(True)
-            self._rec_stats_label.setText(f"记录中: {self._record_file.name}\n0 行")
+            self._rec_stats_label.setText(f"记录中: {file_path.name}\n0 行")
             self._update_global_bar(
                 self._ctrl.is_connected if self._ctrl else False,
                 self._ctrl.is_streaming if self._ctrl else False,
             )
-            self.log(f"[GUI] 开始记录: {self._record_file}")
+            self.log(f"[GUI] 开始记录: {file_path}")
         except OSError as exc:
             self.log(f"[GUI] 记录失败: {exc}")
+            self._recorder = None
 
     def _on_stop_recording(self) -> None:
-        self._recording = False
-        if self._record_handle:
-            self._record_handle.close()
-            self._record_handle = None
+        if self._recorder:
+            self._recorder.stop()
+            row_count = self._recorder.row_count
+            file_path = self._recorder.file_path
+            self._recorder = None
+            self.log(f"[GUI] 停止记录: {file_path} ({row_count} 行)")
         self._rec_start_btn.setEnabled(True)
         self._rec_stop_btn.setEnabled(False)
         self._rec_stats_label.setText("记录已停止")
@@ -904,23 +1120,37 @@ class GaussMeterGUI(QMainWindow):
             self._ctrl.is_connected if self._ctrl else False,
             self._ctrl.is_streaming if self._ctrl else False,
         )
-        self.log(f"[GUI] 停止记录: {self._record_file}")
 
     # ==================================================================
     # 信号处理 — 来自 CommandService 的广播
     # ==================================================================
 
     def _on_stream_batch(self, batch: dict) -> None:
-        """批量数据: 更新数值显示 + 推入 CircularBuffer + CSV 记录。"""
+        """批量数据: 应用零偏、更新数值显示、推入 CircularBuffer、CSV 记录。"""
         points = batch.get("points", [])
         if not points:
             return
 
-        # 用批量中的最新点更新数值显示
+        # 应用软件零点偏移
+        if self._zero_offset != 0.0:
+            offset = self._zero_offset
+            points = [{**p, "field_mt": p.get("field_mt", 0.0) - offset} for p in points]
+
+        # 用批量中的最新点更新数值显示 (精度跟随当前采集模式)
         latest = batch.get("latest", {})
         if latest:
-            self._field_label.setText(f"{latest.get('field_mt', 0):.4f} mT")
-            self._freq_label.setText(f"{latest.get('freq_hz', 0):.0f} Hz")
+            mode = self._get_active_acq_mode()
+            dec = mode["decimals"]
+            field_raw = latest.get("field_mt", 0)
+            field_display = field_raw - self._zero_offset
+            self._field_label.setText(f"{field_display:.{dec}f} mT")
+
+            freq = latest.get("freq_hz", 0)
+            if freq < 0.01:
+                self._freq_label.setText("DC")
+            else:
+                self._freq_label.setText(f"{freq:.0f} Hz")
+
             self._temp_label.setText(f"{latest.get('temp_c', 0):.1f} °C")
 
         self._total_points += len(points)
@@ -936,18 +1166,10 @@ class GaussMeterGUI(QMainWindow):
             timestamps,
         )
 
-        # 批量 CSV 记录 (减少系统调用)
-        if self._recording and self._record_handle:
+        # CSV 记录 (使用 CH1600Recorder)
+        if self._recorder and self._recorder.is_recording:
             try:
-                lines = []
-                for p in points:
-                    lines.append(
-                        f"{p.get('timestamp_s', 0):.6f},"
-                        f"{p.get('field_mt', 0):.6f},"
-                        f"{p.get('freq_hz', 0):.1f},"
-                        f"{p.get('temp_c', 0):.2f}"
-                    )
-                self._record_handle.write("\n".join(lines) + "\n")
+                self._recorder.write_batch(points)
             except Exception:
                 pass
 
@@ -958,8 +1180,16 @@ class GaussMeterGUI(QMainWindow):
         self._unit_label.setText(unit)
         self._range_label.setText(rng)
 
+        panel_streaming = state.get("panel_streaming", False)
+        if panel_streaming:
+            self._status_label.setText("面板实时发送模式 — 指令不可用 / Panel Streaming — No Commands")
+        elif self._ctrl and self._ctrl.is_connected:
+            self._status_label.setText("就绪 / Ready")
+
         if self._ctrl:
-            self._global_info.setText(f"{unit} | {rng}")
+            mode = self._get_active_acq_mode()
+            short_label = mode["label"].split("(")[0].strip()
+            self._global_info.setText(f"{unit} | {rng} | {short_label}")
 
     def _on_error(self, msg: str) -> None:
         self.log(f"[ERROR] {msg}")
@@ -982,7 +1212,7 @@ class GaussMeterGUI(QMainWindow):
         if not _HAS_PYG or self._plot_widget is None:
             return
 
-        # FPS 计数
+        # FPS 计数 (始终更新, 不受暂停影响)
         self._display_count += 1
         now = time.time()
         elapsed = max(now - self._display_fps_ts, 0.001)
@@ -991,41 +1221,53 @@ class GaussMeterGUI(QMainWindow):
             self._display_count = 0
             self._display_fps_ts = now
 
-        ds = self._cfg.get("ui", {}).get("chart_downsample", 2)
+        # 根据采集模式选择图表参数
+        mode = self._get_active_acq_mode()
+        ds = mode["downsample"]
+        x_window = mode["x_window_s"]
         max_pts = self._cfg.get("ui", {}).get("chart_history_points", 5000) // ds
 
-        # 磁场曲线
-        ts_arr, vals = self._buffer.get("field_mt", max_points=max_pts, downsample=ds)
-        if len(ts_arr) > 0:
-            ts_rel = ts_arr - ts_arr[-1]  # 相对时间 (秒)
-            self._field_curve.setData(ts_rel, vals)
+        # 图表更新 — 暂停时跳过
+        if not self._display_paused:
+            # 磁场曲线
+            ts_arr, vals = self._buffer.get("field_mt", max_points=max_pts, downsample=ds)
+            if len(ts_arr) > 0:
+                ts_rel = ts_arr - ts_arr[-1]  # 相对时间 (秒)
+                self._field_curve.setData(ts_rel, vals)
 
-            # 自动 Y 轴
-            if self._auto_y_cb.isChecked():
-                y_min, y_max = vals.min(), vals.max()
-                margin = max(abs(y_min), abs(y_max)) * 0.1 + 1e-6
-                self._plot_widget.setYRange(y_min - margin, y_max + margin, padding=0)
+                # 固定 X 轴窗口 (滚动视图)
+                self._plot_widget.setXRange(-x_window, 0.5, padding=0)
 
-        # 频率曲线
-        if self._show_freq_cb.isChecked():
-            ts_f, v_f = self._buffer.get("freq_hz", max_points=max_pts, downsample=ds)
-            if len(ts_f) > 0:
-                ts_f_rel = ts_f - ts_f[-1]
-                self._freq_curve.setData(ts_f_rel, v_f)
+                # 自动 Y 轴
+                if self._auto_y_cb.isChecked():
+                    y_min, y_max = vals.min(), vals.max()
+                    margin = max(abs(y_min), abs(y_max)) * 0.1 + 1e-6
+                    self._plot_widget.setYRange(y_min - margin, y_max + margin, padding=0)
 
-        # 统计
+            # 频率曲线
+            if self._show_freq_cb.isChecked():
+                ts_f, v_f = self._buffer.get("freq_hz", max_points=max_pts, downsample=ds)
+                if len(ts_f) > 0:
+                    ts_f_rel = ts_f - ts_f[-1]
+                    self._freq_curve.setData(ts_f_rel, v_f)
+
+        # 统计 — 显示实际 FPS 和期望 FPS
+        pause_indicator = " [PAUSED]" if self._display_paused else ""
         self._live_stats.setText(
-            f"FPS: {self._display_fps:.1f} | 数据点: {self._total_points}"
+            f"FPS: {self._display_fps:.1f} (期望~{mode['expect_fps']} Hz) | "
+            f"数据点: {self._total_points} | 模式: {mode['label'].split('(')[0].strip()}"
+            f"{pause_indicator}"
         )
 
         self._global_fps.setText(f"FPS: {self._display_fps:.1f}")
         self._global_pts.setText(f"{self._total_points} pts")
 
         # 记录统计
-        if self._recording and self._record_handle:
+        if self._recorder and self._recorder.is_recording:
+            fname = self._recorder.file_path.name if self._recorder.file_path else "?"
             self._rec_stats_label.setText(
-                f"记录中: {self._record_file.name if self._record_file else '?'}\n"
-                f"已记录: {self._total_points} 行"
+                f"记录中: {fname}\n"
+                f"已记录: {self._recorder.row_count} 行"
             )
 
     def _on_toggle_freq_curve(self, visible: bool) -> None:
@@ -1048,8 +1290,8 @@ class GaussMeterGUI(QMainWindow):
     def closeEvent(self, event) -> None:
         if self._cmd_service:
             self._cmd_service.stop()
-        if self._record_handle:
-            self._record_handle.close()
+        if self._recorder and self._recorder.is_recording:
+            self._recorder.stop()
         # 保存配置
         try:
             save_config(self._cfg)

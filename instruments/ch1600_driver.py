@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import threading
+import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -59,6 +60,12 @@ class CH1600Driver:
     def is_streaming(self) -> bool:
         with self._lock:
             return self._streaming
+
+    @property
+    def is_panel_streaming_mode(self) -> bool:
+        """设备是否处于面板实时发送模式 (此模式下 RS-232 指令不可用)。"""
+        with self._lock:
+            return getattr(self, '_panel_streaming_mode', False)
 
     @property
     def cached_field_mt(self) -> float:
@@ -107,20 +114,18 @@ class CH1600Driver:
     ) -> str:
         """打开串口并返回设备标识。
 
-        Raises:
-            RuntimeError: pyserial 未安装
-            serial.SerialException: 串口打开失败
+        自动检测面板实时发送模式: 连接后等待 300ms,
+        若有数据帧到达则判定为面板流模式 (此模式下 RS-232 指令不可用)。
         """
         if serial is None:
             raise RuntimeError("pyserial is not installed")
-        # 使用极短超时: 命令模式用 read_until 覆盖, 流模式用 in_waiting+read
         self._serial = serial.Serial(
             port=port,
             baudrate=baudrate,
             bytesize=bytesize,
             parity=parity,
             stopbits=stopbits,
-            timeout=0.05,  # 短超时用于流读取, 命令读取用 read_until
+            timeout=0.05,
         )
         try:
             self._serial.reset_input_buffer()
@@ -133,10 +138,29 @@ class CH1600Driver:
             self._serial = None
             raise
 
-        # 查询设备单位，验证 CH-1600 身份
+        self._panel_streaming_mode = False
+
+        # 先静默观察: 设备是否已在发送数据?
+        _time.sleep(0.35)
+        preview = self._read_available()
+        if preview:
+            # 检查是否是数据帧 (面板实时发送模式)
+            frame = CH1600Driver.parse_stream_frame(preview)
+            if frame is not None:
+                self._panel_streaming_mode = True
+                self._cached_field_mt = frame["field_mt"]
+                self._cached_freq_hz = frame["freq_hz"]
+                self._cached_temp_c = frame["temp_c"]
+                return f"CH-1600@{port} (面板实时发送模式, 指令不可用)"
+
+        # 正常模式: 发送 UNIT?> 查询设备身份
         try:
             unit = self.query_unit()
-            idn = f"CH-1600@{port} (unit={unit})"
+            if unit.startswith("#"):
+                self._panel_streaming_mode = True
+                idn = f"CH-1600@{port} (面板实时发送模式, 指令不可用)"
+            else:
+                idn = f"CH-1600@{port} (unit={unit})"
         except Exception:
             idn = f"CH-1600@{port} (unverified)"
 
@@ -219,11 +243,22 @@ class CH1600Driver:
             except Exception:
                 pass
 
-    def _send_command(self, cmd: str) -> bytes:
-        """发送命令并读取响应行。
+    def _read_available(self) -> bytes:
+        """读取串口缓冲区中所有可用字节 (无阻塞)。需在 _lock 内调用。"""
+        if self._serial is None or not self._serial.is_open:
+            return b""
+        n = self._serial.in_waiting
+        if n == 0:
+            return b""
+        data = self._serial.read(n)
+        return data if data else b""
 
-        命令以 CR (0x0D) 结尾，响应以 \\n 结尾。
-        read_until 使用较长的内部超时 (1.0s) 等待完整响应。
+    def _send_command(self, cmd: str) -> bytes:
+        """发送命令并读取响应。
+
+        命令以 CR (0x0D) 结尾。先发送命令, 等待设备处理,
+        然后读取所有可用字节作为响应。
+        兼容有/无 \\n 终止符的响应格式。
         """
         with self._lock:
             if self._serial is None or not self._serial.is_open:
@@ -235,35 +270,27 @@ class CH1600Driver:
                     self._raw_log_cb("TX", tx)
                 except Exception:
                     pass
-            # 临时设为较长超时等待命令响应，完成后恢复短超时
-            old_timeout = self._serial.timeout
-            self._serial.timeout = 1.0
-            try:
-                line = self._serial.read_until(b"\n")
-            finally:
-                self._serial.timeout = old_timeout
-            if self._raw_log_cb:
+            # 等待设备处理命令 (150ms) + 响应到达 (最多再等 250ms)
+            _time.sleep(0.15)
+            # 分两轮读取, 确保捕获完整响应
+            data = self._read_available()
+            if len(data) == 0:
+                _time.sleep(0.25)
+                data = self._read_available()
+            if self._raw_log_cb and data:
                 try:
-                    self._raw_log_cb("RX", line)
+                    self._raw_log_cb("RX", data)
                 except Exception:
                     pass
-            return line
+            return data
 
-    def read_stream_data(self, timeout: float = 0.0) -> Optional[bytes]:
-        """非阻塞读取可用字节（用于数据流模式）。
-
-        不修改 serial.timeout，避免 Windows pyserial 缓冲区重置。
-        返回 None 表示无可用数据。
-        """
+    def read_stream_data(self) -> Optional[bytes]:
+        """非阻塞读取可用字节（用于数据流模式）。返回 None 表示无可用数据。"""
         with self._lock:
             if self._serial is None or not self._serial.is_open:
                 raise ConnectionError("CH-1600 未连接")
             try:
-                waiting = self._serial.in_waiting
-                if waiting == 0:
-                    return None
-                data = self._serial.read(waiting)
-                return data if data else None
+                return self._read_available() or None
             except Exception:
                 return None
 
@@ -302,7 +329,12 @@ class CH1600Driver:
     # ------------------------------------------------------------------
 
     def start_streaming(self) -> None:
-        """启动实时数据流 (DATA?>)。"""
+        """启动实时数据流 (DATA?> 或直接读取面板模式流)。"""
+        if self._panel_streaming_mode:
+            # 面板模式: 设备已在发送数据, 直接开始读取
+            with self._lock:
+                self._streaming = True
+            return
         self._send_command("DATA?")
         # 排空启动时的残留缓冲数据，需在锁内访问 _serial
         with self._lock:
@@ -314,7 +346,12 @@ class CH1600Driver:
                 pass
 
     def stop_streaming(self) -> None:
-        """停止实时数据流 (DATAC>)。"""
+        """停止实时数据流 (DATAC> 或仅标记停止)。"""
+        if self._panel_streaming_mode:
+            # 面板模式: 不发送 DATAC> (会被忽略), 仅标记停止
+            with self._lock:
+                self._streaming = False
+            return
         try:
             self._send_command("DATAC")
         except Exception:

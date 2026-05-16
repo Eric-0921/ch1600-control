@@ -7,14 +7,16 @@
     "stopbits": 1,
     "timeout": 1.0,
     "stream_batch_size": 100,
-    "stream_batch_interval_s": 0.030
-  },
-  "monitor": {
-    "interval_ms": 500
+    "stream_batch_interval_s": 0.03
   },
   "acquisition": {
     "save_dir": "./experiments",
-    "auto_save": false
+    "auto_save": false,
+    "mode_key": "dc_normal",
+    "zero_offset": 0.0
+  },
+  "monitor": {
+    "interval_ms": 500
   },
   "ui": {
     "display_interval_ms": 30,

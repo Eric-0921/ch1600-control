@@ -14,7 +14,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
@@ -87,30 +87,42 @@ class CommandService(QObject):
         return cmd.request_id
 
     def submit_sync(self, cmd: Command, timeout: float = 5.0) -> Any:
-        """同步提交命令, 等待完成并返回结果。"""
-        event = threading.Event()
+        """同步提交命令, 等待完成并返回结果。
+
+        使用 QEventLoop 而非 threading.Event, 确保 Qt 跨线程信号
+        (command_completed / command_error) 能在主线程事件循环中被正常投递。
+        """
+        loop = QEventLoop()
         result_holder: Dict[str, Any] = {}
 
         def _on_done(rid: str, result: Any) -> None:
             if rid == cmd.request_id:
                 result_holder["result"] = result
-                event.set()
+                loop.quit()
 
         def _on_err(rid: str, err: str) -> None:
             if rid == cmd.request_id:
                 result_holder["error"] = err
-                event.set()
+                loop.quit()
 
         self.command_completed.connect(_on_done)
         self.command_error.connect(_on_err)
 
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(int(timeout * 1000))
+
         try:
             self._queue.put(cmd)
-            if event.wait(timeout):
-                if "error" in result_holder:
-                    raise RuntimeError(result_holder["error"])
-                return result_holder.get("result")
-            raise TimeoutError(f"命令 {cmd.cmd_type.name} 超时 ({timeout}s)")
+            loop.exec_()
+            if not timer.isActive():
+                # timer fired → timeout
+                raise TimeoutError(f"命令 {cmd.cmd_type.name} 超时 ({timeout}s)")
+            timer.stop()
+            if "error" in result_holder:
+                raise RuntimeError(result_holder["error"])
+            return result_holder.get("result")
         finally:
             try:
                 self.command_completed.disconnect(_on_done)
@@ -157,15 +169,11 @@ class CommandService(QObject):
         elif ct == CommandType.CH1600_SCAN_PORTS:
             return self._ctrl.scan_ports()
 
-        # 数据流
+        # 数据流 (由 start_acquisition/stop_acquisition 直接调用, 不走命令队列)
         elif ct == CommandType.CH1600_START_STREAM:
-            self._ctrl.start_streaming(
-                batch_size=p.get("batch_size", 100),
-            )
-            return None
+            raise RuntimeError("START_STREAM 必须通过 start_acquisition() 在主线程调用")
         elif ct == CommandType.CH1600_STOP_STREAM:
-            self._ctrl._stop_streaming()
-            return None
+            raise RuntimeError("STOP_STREAM 必须通过 stop_acquisition() 在主线程调用")
         elif ct == CommandType.CH1600_QUERY_DATA_ONCE:
             return self._ctrl.driver.query_data_once()
 
@@ -244,13 +252,16 @@ class CommandService(QObject):
         self.submit_sync(cmd, timeout=3.0)
 
     def start_acquisition(self) -> None:
-        """启动数据采集 (流 + 监控)。"""
-        self.submit(Command(cmd_type=CommandType.CH1600_START_STREAM))
+        """启动数据采集 (流 + 监控)。必须在主线程调用。"""
+        # 直接调用 (创建 QThread 必须在主线程)
+        self._ctrl.start_streaming(
+            batch_size=self._cfg.get("ch1600", {}).get("stream_batch_size", 100)
+        )
         self._ctrl.start_monitoring(interval_ms=500)
 
     def stop_acquisition(self) -> None:
-        """停止数据采集。"""
-        self.submit(Command(cmd_type=CommandType.CH1600_STOP_STREAM))
+        """停止数据采集。必须在主线程调用。"""
+        self._ctrl._stop_streaming()
         self._ctrl._stop_monitoring()
 
     def do_zero(self) -> None:

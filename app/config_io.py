@@ -17,6 +17,21 @@ from typing import Any, Dict, Optional
 # 默认配置
 # ------------------------------------------------------------------
 
+# 采集模式 → 图表优化映射
+# mode_key: (预期FPS, 数值精度小数位, X轴窗口秒, 降采样因子)
+ACQ_MODE_TABLE: Dict[str, Dict[str, Any]] = {
+    "dc_normal":   {"label": "DC 常速 (~4-10 Hz)",    "expect_fps": 6,   "decimals": 4, "x_window_s": 60, "downsample": 1, "resolution": "±0.00001 mT", "accuracy": "0.05%"},
+    "dc_20hz":     {"label": "DC 快速 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 20, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%"},
+    "dc_50hz":     {"label": "DC 快速 50 Hz",          "expect_fps": 50,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.015%"},
+    "dc_100hz":    {"label": "DC 高速 100 Hz",         "expect_fps": 100, "decimals": 2, "x_window_s": 5,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%"},
+    "dc_200hz":    {"label": "DC 高速 200 Hz",         "expect_fps": 200, "decimals": 1, "x_window_s": 2,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
+    "dc_200plus":  {"label": "DC 超高速 200+ Hz",      "expect_fps": 250, "decimals": 1, "x_window_s": 1,  "downsample": 6, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
+    "ac_20hz":     {"label": "AC 低频 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%"},
+    "ac_50hz":     {"label": "AC 中高频 50 Hz",        "expect_fps": 50,  "decimals": 2, "x_window_s": 5,  "downsample": 1, "resolution": "±0.01 mT",    "accuracy": "0.015%"},
+    "ac_100hz":    {"label": "AC 中高频 100 Hz",       "expect_fps": 100, "decimals": 2, "x_window_s": 2,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%"},
+    "ac_200hz":    {"label": "AC 中高频 200 Hz",       "expect_fps": 200, "decimals": 1, "x_window_s": 1,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
+}
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "ch1600": {
         "port": "COM1",
@@ -28,12 +43,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "stream_batch_size": 100,
         "stream_batch_interval_s": 0.030,
     },
-    "monitor": {
-        "interval_ms": 500,
-    },
     "acquisition": {
         "save_dir": "./experiments",
         "auto_save": False,
+        "mode_key": "dc_normal",
+        "zero_offset": 0.0,
+    },
+    "monitor": {
+        "interval_ms": 500,
     },
     "ui": {
         "display_interval_ms": 30,

@@ -226,6 +226,7 @@ class InstrumentController(QObject):
             "range": self._driver.cached_range,
             "streaming": self._driver.is_streaming,
             "connected": self._driver.is_connected,
+            "panel_streaming": self._driver.is_panel_streaming_mode,
         })
 
     def emergency_stop(self) -> bool:
