@@ -1,0 +1,26 @@
+{
+  "ch1600": {
+    "port": "COM1",
+    "baudrate": 115200,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout": 1.0,
+    "stream_batch_size": 100,
+    "stream_batch_interval_s": 0.030
+  },
+  "monitor": {
+    "interval_ms": 500
+  },
+  "acquisition": {
+    "save_dir": "./experiments",
+    "auto_save": false
+  },
+  "ui": {
+    "display_interval_ms": 30,
+    "chart_history_points": 5000,
+    "chart_downsample": 2,
+    "window_width": 1200,
+    "window_height": 800
+  }
+}
