@@ -523,9 +523,9 @@ class CH1600Driver:
     @staticmethod
     def _parse_fluxmeter(text: str, length: int) -> Optional[Dict[str, float]]:
         try:
-            text = text.lstrip("\0")
-            core = text[2:]
-            parts = core.split("/")
+            # C# 行为: 去掉开头的 \0 和 #, 去掉结尾的 >, 然后按 / 分割
+            text = text.lstrip("\0").lstrip("#").rstrip(">")
+            parts = text.split("/")
             if len(parts) != 3:
                 return None
             field_x = float(parts[0])
