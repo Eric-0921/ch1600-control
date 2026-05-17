@@ -37,12 +37,14 @@ class CH1600StreamWorker(QObject):
         batch_size: int = 100,
         batch_interval_s: float = 0.030,
         mode_key: str = "dc_normal",
+        device_model: str = "1d_gauss",
     ) -> None:
         super().__init__()
         self._driver = driver
         self._batch_size = batch_size
         self._batch_interval_s = batch_interval_s
         self._mode_key = mode_key
+        self._device_model = device_model
         self._stop_requested = False
         self._read_buffer = b""
         self._point_count = 0
@@ -54,7 +56,7 @@ class CH1600StreamWorker(QObject):
 
         # 启动设备端的实时发送
         try:
-            self._driver.start_streaming(self._mode_key)
+            self._driver.start_streaming(self._mode_key, model=self._device_model)
         except Exception as exc:
             self.error_occurred.emit(f"[CH-1600] 启动数据流失败: {exc}")
             self.finished.emit()
@@ -80,7 +82,9 @@ class CH1600StreamWorker(QObject):
                         # 按 \n 分割完整帧
                         while b"\n" in self._read_buffer:
                             line, self._read_buffer = self._read_buffer.split(b"\n", 1)
-                            parsed = CH1600Driver.parse_stream_frame(line)
+                            parsed = CH1600Driver.parse_stream_frame(
+                                line, model=self._device_model
+                            )
                             if parsed is not None:
                                 parsed["timestamp_s"] = time.perf_counter()
                                 batch_points.append(parsed)

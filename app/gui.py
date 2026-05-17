@@ -1810,6 +1810,7 @@ class GaussMeterGUI(QMainWindow):
             max_file_size_mb=self._max_size_spin.value(),
             max_file_rows=self._max_rows_spin.value(),
             rollover_strategy=self._strategy_combo.currentText(),
+            device_model=self._device_model,
         )
         try:
             file_path = self._recorder.start()
@@ -2064,20 +2065,29 @@ class GaussMeterGUI(QMainWindow):
                     ts = p.get("timestamp_s", 0)
                     self._data_table.setItem(row, 4, QTableWidgetItem(f"{ts:.6f}"))
                 elif self._device_model == "2d_gauss":
-                    self._data_table.setItem(row, 1, QTableWidgetItem("0.000000"))  # X
-                    self._data_table.setItem(row, 2, QTableWidgetItem("0.000000"))  # Y
-                    self._data_table.setItem(row, 3, QTableWidgetItem("0.000000"))  # total_B
+                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
                     self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
                     self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
                     ts = p.get("timestamp_s", 0)
                     self._data_table.setItem(row, 6, QTableWidgetItem(f"{ts:.6f}"))
-                elif self._device_model in ("3d_gauss", "3d_fluxgate"):
-                    self._data_table.setItem(row, 1, QTableWidgetItem("0.000000"))  # X
-                    self._data_table.setItem(row, 2, QTableWidgetItem("0.000000"))  # Y
-                    self._data_table.setItem(row, 3, QTableWidgetItem("0.000000"))  # Z
-                    self._data_table.setItem(row, 4, QTableWidgetItem("0.000000"))  # total_B
+                elif self._device_model == "3d_gauss":
+                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_z_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
                     self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
                     self._data_table.setItem(row, 6, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
+                    ts = p.get("timestamp_s", 0)
+                    self._data_table.setItem(row, 7, QTableWidgetItem(f"{ts:.6f}"))
+                elif self._device_model == "3d_fluxgate":
+                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_z_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 5, QTableWidgetItem("—"))
+                    self._data_table.setItem(row, 6, QTableWidgetItem("—"))
                     ts = p.get("timestamp_s", 0)
                     self._data_table.setItem(row, 7, QTableWidgetItem(f"{ts:.6f}"))
                 else:

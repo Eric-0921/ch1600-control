@@ -1,6 +1,7 @@
 """CH-1600 CSV 数据记录器
 
 将磁场数据流写入 CSV 文件, 带 UTF-8 BOM 编码。
+支持根据设备型号动态调整表头和列数。
 """
 
 from __future__ import annotations
@@ -10,10 +11,28 @@ from typing import Dict, List, Optional
 import datetime
 
 
+# 模型 -> 输出列定义 (ordered)
+_RECORDER_SCHEMA: Dict[str, List[str]] = {
+    "1d_gauss":     ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
+    "2d_gauss":     ["timestamp_s", "field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"],
+    "3d_gauss":     ["timestamp_s", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"],
+    "fluxmeter":    ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
+    "1d_fluxgate":  ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
+    "3d_fluxgate":  ["timestamp_s", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"],
+}
+
+
+def _get_schema(model: str) -> List[str]:
+    return _RECORDER_SCHEMA.get(model, _RECORDER_SCHEMA["1d_gauss"])
+
+
 class CH1600Recorder:
     """CSV 数据记录器。
 
-    写入格式: timestamp_s,field_mt,freq_hz,temp_c
+    写入格式根据 device_model 动态决定:
+      1D : timestamp_s,field_total_mt,freq_hz,temp_c
+      2D : timestamp_s,field_x_mt,field_y_mt,field_total_mt,freq_hz,temp_c
+      3D : timestamp_s,field_x_mt,field_y_mt,field_z_mt,field_total_mt,freq_hz,temp_c
     """
 
     def __init__(
@@ -22,6 +41,7 @@ class CH1600Recorder:
         max_file_size_mb: float = 100.0,
         max_file_rows: int = 100000,
         rollover_strategy: str = "new_file",
+        device_model: str = "1d_gauss",
     ) -> None:
         self._output_dir = output_dir or Path("./experiments")
         self._handle = None
@@ -35,6 +55,12 @@ class CH1600Recorder:
         self.rollover_strategy = rollover_strategy
         self._stopped_by_rollover = False
         self._rollover_reason: Optional[str] = None
+        self._device_model = device_model
+        self._schema = _get_schema(device_model)
+
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
 
     @property
     def is_recording(self) -> bool:
@@ -61,6 +87,14 @@ class CH1600Recorder:
     @property
     def rollover_reason(self) -> Optional[str]:
         return self._rollover_reason
+
+    @property
+    def schema(self) -> List[str]:
+        return list(self._schema)
+
+    # ------------------------------------------------------------------
+    # rollover
+    # ------------------------------------------------------------------
 
     def _check_rollover(self) -> None:
         """检查是否需要 rollover。"""
@@ -91,8 +125,12 @@ class CH1600Recorder:
             / f"{self._prefix}_{self._timestamp}_{self._file_index}.csv"
         )
         self._handle = open(self._file_path, "w", encoding="utf-8-sig")
-        self._handle.write("timestamp_s,field_mt,freq_hz,temp_c\n")
+        self._handle.write(",".join(self._schema) + "\n")
         self._row_count = 0
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
 
     def start(self, prefix: str = "ch1600") -> Path:
         """开始记录, 返回文件路径。"""
@@ -105,7 +143,7 @@ class CH1600Recorder:
         self._file_path = self._output_dir / f"{prefix}_{self._timestamp}.csv"
 
         self._handle = open(self._file_path, "w", encoding="utf-8-sig")
-        self._handle.write("timestamp_s,field_mt,freq_hz,temp_c\n")
+        self._handle.write(",".join(self._schema) + "\n")
         self._row_count = 0
         self._stopped_by_rollover = False
         self._rollover_reason = None
@@ -118,28 +156,61 @@ class CH1600Recorder:
             self._handle.close()
             self._handle = None
 
-    def write_point(
-        self, field_mt: float, freq_hz: float, temp_c: float, timestamp_s: float
-    ) -> None:
-        """写入单点。"""
+    # ------------------------------------------------------------------
+    # write
+    # ------------------------------------------------------------------
+
+    def write_point(self, data: Dict[str, float]) -> None:
+        """写入单点。
+
+        Args:
+            data: 必须包含 'timestamp_s' 以及 schema 中定义的所有字段。
+                  缺失字段自动补 0.0。
+        """
         if self._handle is None or self._stopped_by_rollover:
             return
-        self._handle.write(
-            f"{timestamp_s:.6f},{field_mt:.6f},{freq_hz:.1f},{temp_c:.2f}\n"
-        )
+        values = [data.get(col, 0.0) for col in self._schema]
+        # 格式化: timestamp 6位小数, field 6位, freq 1位, temp 2位
+        fmt_parts: List[str] = []
+        for col, val in zip(self._schema, values):
+            if col == "timestamp_s":
+                fmt_parts.append(f"{val:.6f}")
+            elif col.startswith("field_"):
+                fmt_parts.append(f"{val:.6f}")
+            elif col == "freq_hz":
+                fmt_parts.append(f"{val:.1f}")
+            elif col == "temp_c":
+                fmt_parts.append(f"{val:.2f}")
+            else:
+                fmt_parts.append(str(val))
+        self._handle.write(",".join(fmt_parts) + "\n")
         self._row_count += 1
         self._check_rollover()
 
     def write_batch(self, points: List[Dict[str, float]]) -> None:
-        """批量写入。每个点包含 {field_mt, freq_hz, temp_c, timestamp_s}。"""
+        """批量写入。
+
+        每个点包含 schema 中对应字段即可, 缺失字段自动补 0.0。
+        """
         if self._handle is None or self._stopped_by_rollover:
             return
+        lines: List[str] = []
         for p in points:
-            self._handle.write(
-                f"{p.get('timestamp_s', 0):.6f},"
-                f"{p.get('field_mt', 0):.6f},"
-                f"{p.get('freq_hz', 0):.1f},"
-                f"{p.get('temp_c', 0):.2f}\n"
-            )
-        self._row_count += len(points)
-        self._check_rollover()
+            values = [p.get(col, 0.0) for col in self._schema]
+            fmt_parts: List[str] = []
+            for col, val in zip(self._schema, values):
+                if col == "timestamp_s":
+                    fmt_parts.append(f"{val:.6f}")
+                elif col.startswith("field_"):
+                    fmt_parts.append(f"{val:.6f}")
+                elif col == "freq_hz":
+                    fmt_parts.append(f"{val:.1f}")
+                elif col == "temp_c":
+                    fmt_parts.append(f"{val:.2f}")
+                else:
+                    fmt_parts.append(str(val))
+            lines.append(",".join(fmt_parts))
+        if lines:
+            self._handle.write("\n".join(lines) + "\n")
+            self._row_count += len(points)
+            self._check_rollover()

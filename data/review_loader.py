@@ -144,8 +144,25 @@ def load_review_files(paths: List[Path]) -> Tuple[np.ndarray, int]:
     return merged, ok_count
 
 
+def _safe_channel_stats(arr: np.ndarray, name: str) -> dict:
+    """安全地获取某通道统计信息。"""
+    if name not in (arr.dtype.names or ()):
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
+    data = arr[name]
+    # 过滤 NaN
+    valid = data[~np.isnan(data)]
+    if valid.size == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
+    return {
+        "min": float(np.min(valid)),
+        "max": float(np.max(valid)),
+        "mean": float(np.mean(valid)),
+        "std": float(np.std(valid)),
+    }
+
+
 def get_review_summary(arr: np.ndarray) -> dict:
-    """返回数据摘要。"""
+    """返回数据摘要（支持多通道）。"""
     if arr is None or arr.size == 0:
         return {
             "count": 0,
@@ -153,6 +170,7 @@ def get_review_summary(arr: np.ndarray) -> dict:
             "field_min": 0.0,
             "field_max": 0.0,
             "field_mean": 0.0,
+            "channels": {},
         }
     ts = arr["timestamp_s"]
     # 优先使用 field_total_mt, 否则回退到 field_mt (向后兼容)
@@ -160,10 +178,21 @@ def get_review_summary(arr: np.ndarray) -> dict:
         field = arr["field_total_mt"]
     else:
         field = arr["field_mt"]
+
+    # 收集所有可用的 field_* 通道统计
+    channels = {}
+    for ch in ("field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "field_mt"):
+        if ch in (arr.dtype.names or ()):
+            channels[ch] = _safe_channel_stats(arr, ch)
+    for ch in ("freq_hz", "temp_c"):
+        if ch in (arr.dtype.names or ()):
+            channels[ch] = _safe_channel_stats(arr, ch)
+
     return {
         "count": int(arr.size),
         "duration_s": float(ts[-1] - ts[0]) if arr.size > 1 else 0.0,
         "field_min": float(np.min(field)),
         "field_max": float(np.max(field)),
         "field_mean": float(np.mean(field)),
+        "channels": channels,
     }

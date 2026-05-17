@@ -119,6 +119,17 @@ Based on reverse-engineering findings from DataReader2.exe (ILSpy decompilation)
   - `_parse_3d_fluxgate` — `X/Y/Z` frame, no freq/temp
 - **Unified return format**: All parsers return `{"field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c", "field_mt"}` where `"field_mt"` is a backward-compat alias equal to `field_total_mt`.
 
+#### Stage 2 — Data Layer
+- **`CH1600Recorder`**: Dynamic schema per device model. Table header and `write_point`/`write_batch` now adapt to 1D/2D/3D/fluxmeter/fluxgate columns automatically.
+- **`get_review_summary`**: Multi-channel statistics (min/max/mean/std for field_x/y/z/total, freq, temp).
+- **`CircularBuffer`**: Already multi-channel capable; no changes required.
+
+#### Stage 3 — Core Layer Propagation
+- **`CH1600StreamWorker`**: Accepts `device_model` parameter, passes it to `parse_stream_frame()` and `start_streaming()`.
+- **`InstrumentController.start_streaming`**: Forwards `device_model` to worker.
+- **`CommandService.start_acquisition`**: Reads `device_model` from config and propagates through the stack.
+- **Bugfix (GUI table placeholders)**: 2D/3D live data table was showing `"0.000000"` placeholders instead of actual `field_x/y/z_mt` values — now fixed.
+
 ### Dependencies Added
 - `openpyxl` — Excel export (already present in Anaconda environment)
 - `pyzmq` — ZMQ IPC (already present in Anaconda environment)
