@@ -19,6 +19,7 @@ A high-performance Python application for controlling and acquiring data from th
 - **Raw serial debug** — Hex/ASCII TX/RX monitor with manual command input and quick buttons
 - **External IPC** — ZMQ PUB/REP + Windows NamedPipe for third-party integration
 - **Chart customization** — curve colors, line width, history points, manual/auto Y-axis range
+- **Multi-device model support** — 1D/2D/3D Gauss meter, Fluxmeter, 1D/3D Fluxgate with model-aware parsing and dynamic GUI columns
 - **Industrial UI** — Siemens-style dark/light theme with connection/stream/record status LEDs
 - **6-layer architecture** — clean separation: data → instruments → core → workers → app
 
@@ -103,10 +104,18 @@ main.py                     # Entry point (QApplication + Fusion style)
 | Terminator | CR (`\r`, 0x0D) |
 | Max command rate | 10 commands/sec |
 
-**Data frame (streaming):** `#±xxxxx.xxxx/xxx/±xxxx>\n`
-- `field_mt`: magnetic field in mT
-- `freq_hz`: frequency (000 for DC)
-- `temp_c`: probe temperature ×10
+**Data frame (streaming):** model-dependent formats, all normalized to mT internally
+
+| Model | Frame Format | Fields |
+|-------|-------------|--------|
+| 1D Gauss | `#±xxxxx.xxxx/xxx/±xxxx>\n` | field / freq / temp÷10 |
+| 2D Gauss (short) | `#X/ freq /Y>\n` | X / freq / Y |
+| 2D Gauss (long) | `#X/freq/temp;Y/freq/temp>\n` | X,Y + freq + temp |
+| 3D Gauss (short) | `#X/Y/Z>\n` | X / Y / Z |
+| 3D Gauss (long) | `#X/freq/temp;Y/freq/temp;Z/freq/temp>\n` | X,Y,Z + freq + temp |
+| Fluxmeter | `\0#value/freq/temp>\n` | field (mWb) / freq / temp÷10 |
+| 1D Fluxgate | `#value/freq/temp>\n` | field (nT) / freq / temp÷10 |
+| 3D Fluxgate | `#X/Y/Z>\n` | X / Y / Z (no freq/temp) |
 
 **High-speed mode commands:**
 
@@ -131,6 +140,7 @@ Edit `config.json` to customize:
     "port": "COM1",
     "baudrate": 115200
   },
+  "device_model": "1d_gauss",
   "acquisition": {
     "save_dir": "./experiments",
     "mode_key": "dc_normal",
