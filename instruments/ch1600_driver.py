@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -33,6 +34,63 @@ class CH1600Driver:
     DEFAULT_PARITY = "N"
     DEFAULT_STOPBITS = 1
     DEFAULT_TIMEOUT = 1.0
+
+    SPECIAL_PREFIXES = (
+        "HSTDC:", "HSTACL:", "HSTACH:",
+        "HSEDC:", "HSEACL:", "HSEACH:",
+        "UHSDC:", "UHSACL:", "UHSACH:",
+    )
+
+    DEVICE_MODEL_TABLE: Dict[str, Dict[str, Any]] = {
+        "1d_gauss": {
+            "label": "一维高斯计 / 1D Gauss Meter",
+            "dimension": 1,
+            "has_freq": True,
+            "has_temp": True,
+            "unit": "mT",
+            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
+        },
+        "2d_gauss": {
+            "label": "二维高斯计 / 2D Gauss Meter",
+            "dimension": 2,
+            "has_freq": True,
+            "has_temp": True,
+            "unit": "mT",
+            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
+        },
+        "3d_gauss": {
+            "label": "三维高斯计 / 3D Gauss Meter",
+            "dimension": 3,
+            "has_freq": True,
+            "has_temp": True,
+            "unit": "mT",
+            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
+        },
+        "fluxmeter": {
+            "label": "磁通计 / Fluxmeter",
+            "dimension": 1,
+            "has_freq": True,
+            "has_temp": True,
+            "unit": "mWb",
+            "available_units": ["mWb"],
+        },
+        "1d_fluxgate": {
+            "label": "一维磁通门计 / 1D Fluxgate",
+            "dimension": 1,
+            "has_freq": True,
+            "has_temp": True,
+            "unit": "nT",
+            "available_units": ["nT"],
+        },
+        "3d_fluxgate": {
+            "label": "三维磁通门计 / 3D Fluxgate",
+            "dimension": 3,
+            "has_freq": False,
+            "has_temp": False,
+            "unit": "nT",
+            "available_units": ["nT"],
+        },
+    }
 
     def __init__(self) -> None:
         self._serial: Optional[serial.Serial] = None  # type: ignore[name-defined]
@@ -299,28 +357,238 @@ class CH1600Driver:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def parse_stream_frame(line: bytes) -> Optional[Dict[str, float]]:
+    def parse_stream_frame(line: bytes, model: str = "1d_gauss") -> Optional[Dict[str, float]]:
         """解析单帧 DATA?> 流数据。
 
-        格式: #±xxxxx.xxxx/xxx/±xxxx>\\n
-        示例: b'#-12345.6789/050/+0234>\\n'
+        根据 model 分发到对应的私有解析方法，返回统一格式字典。
 
         Returns:
-            {"field_mt": float, "freq_hz": float, "temp_c": float} 或 None
+            {
+                "field_x_mt": float,
+                "field_y_mt": float,
+                "field_z_mt": float,
+                "field_total_mt": float,
+                "freq_hz": float,
+                "temp_c": float,
+                "field_mt": float,  # 向后兼容别名
+            } 或 None
         """
         try:
             text = line.decode("ascii", errors="ignore").strip()
+            length = len(text)
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+        if model == "1d_gauss":
+            return CH1600Driver._parse_1d_gauss(text, length)
+        elif model == "2d_gauss":
+            return CH1600Driver._parse_2d_gauss(text, length)
+        elif model == "3d_gauss":
+            return CH1600Driver._parse_3d_gauss(text, length)
+        elif model == "fluxmeter":
+            return CH1600Driver._parse_fluxmeter(text, length)
+        elif model == "1d_fluxgate":
+            return CH1600Driver._parse_1d_fluxgate(text, length)
+        elif model == "3d_fluxgate":
+            return CH1600Driver._parse_3d_fluxgate(text, length)
+        else:
+            return CH1600Driver._parse_1d_gauss(text, length)
+
+    @staticmethod
+    def _parse_1d_gauss(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            for prefix in CH1600Driver.SPECIAL_PREFIXES:
+                if text.startswith(prefix):
+                    parts = text.split("/")
+                    if len(parts) < 4:
+                        return None
+                    field_x = float(parts[1])
+                    freq = float(parts[2])
+                    temp = float(parts[3].rstrip(">"))
+                    return {
+                        "field_x_mt": field_x,
+                        "field_y_mt": 0.0,
+                        "field_z_mt": 0.0,
+                        "field_total_mt": field_x,
+                        "freq_hz": freq,
+                        "temp_c": temp,
+                        "field_mt": field_x,
+                    }
             if not text.startswith("#"):
                 return None
-            # 移除末尾的 > 和空白
             core = text[1:].rstrip(">").strip()
             parts = core.split("/")
             if len(parts) != 3:
                 return None
-            field_mt = float(parts[0])
-            freq_hz = float(parts[1])
-            temp_c = float(parts[2]) / 10.0
-            return {"field_mt": field_mt, "freq_hz": freq_hz, "temp_c": temp_c}
+            field_x = float(parts[0])
+            freq = float(parts[1])
+            temp = float(parts[2]) / 10.0
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": 0.0,
+                "field_z_mt": 0.0,
+                "field_total_mt": field_x,
+                "freq_hz": freq,
+                "temp_c": temp,
+                "field_mt": field_x,
+            }
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_2d_gauss(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            if not text.startswith("#"):
+                return None
+            core = text[1:].rstrip(">").strip()
+            if length < 40:
+                # 短帧: #X/频率/Y>
+                parts = core.split("/")
+                if len(parts) != 3:
+                    return None
+                field_x = float(parts[0])
+                freq = float(parts[1])
+                field_y = float(parts[2])
+                temp = 0.0
+            else:
+                # 长帧: #X/频率/温度;Y/频率/温度>
+                dg2 = core.split(";")
+                if len(dg2) < 2:
+                    return None
+                x_parts = dg2[0].split("/")
+                y_parts = dg2[1].split("/")
+                if len(x_parts) < 3 or len(y_parts) < 1:
+                    return None
+                field_x = float(x_parts[0])
+                field_y = float(y_parts[0])
+                freq = float(x_parts[1])
+                temp = float(x_parts[2]) / 10.0
+            total = math.sqrt(field_x * field_x + field_y * field_y)
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": field_y,
+                "field_z_mt": 0.0,
+                "field_total_mt": total,
+                "freq_hz": freq,
+                "temp_c": temp,
+                "field_mt": total,
+            }
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_3d_gauss(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            if not text.startswith("#"):
+                return None
+            core = text[1:].rstrip(">").strip()
+            if length < 60:
+                # 短帧: #X/Y/Z>
+                parts = core.split("/")
+                if len(parts) != 3:
+                    return None
+                field_x = float(parts[0])
+                field_y = float(parts[1])
+                field_z = float(parts[2])
+                freq = 0.0
+                temp = 0.0
+            else:
+                # 长帧: #X/频率/温度;Y/频率/温度;Z/频率/温度>
+                dg3 = core.split(";")
+                if len(dg3) < 3:
+                    return None
+                x_parts = dg3[0].split("/")
+                y_parts = dg3[1].split("/")
+                z_parts = dg3[2].split("/")
+                if len(x_parts) < 3 or len(y_parts) < 1 or len(z_parts) < 1:
+                    return None
+                field_x = float(x_parts[0])
+                field_y = float(y_parts[0])
+                field_z = float(z_parts[0])
+                freq = float(x_parts[1])
+                temp = float(x_parts[2]) / 10.0
+            total = math.sqrt(field_x * field_x + field_y * field_y + field_z * field_z)
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": field_y,
+                "field_z_mt": field_z,
+                "field_total_mt": total,
+                "freq_hz": freq,
+                "temp_c": temp,
+                "field_mt": total,
+            }
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_fluxmeter(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            text = text.lstrip("\0")
+            core = text[2:]
+            parts = core.split("/")
+            if len(parts) != 3:
+                return None
+            field_x = float(parts[0])
+            freq = float(parts[1])
+            temp = float(parts[2]) / 10.0
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": 0.0,
+                "field_z_mt": 0.0,
+                "field_total_mt": field_x,
+                "freq_hz": freq,
+                "temp_c": temp,
+                "field_mt": field_x,
+            }
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_1d_fluxgate(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            if not text.startswith("#"):
+                return None
+            core = text[1:].rstrip(">").strip()
+            parts = core.split("/")
+            if len(parts) != 3:
+                return None
+            field_x = float(parts[0])
+            freq = float(parts[1])
+            temp = float(parts[2]) / 10.0
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": 0.0,
+                "field_z_mt": 0.0,
+                "field_total_mt": field_x,
+                "freq_hz": freq,
+                "temp_c": temp,
+                "field_mt": field_x,
+            }
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_3d_fluxgate(text: str, length: int) -> Optional[Dict[str, float]]:
+        try:
+            if not text.startswith("#"):
+                return None
+            core = text[1:].rstrip(">").strip()
+            parts = core.split("/")
+            if len(parts) != 3:
+                return None
+            field_x = float(parts[0])
+            field_y = float(parts[1])
+            field_z = float(parts[2])
+            total = math.sqrt(field_x * field_x + field_y * field_y + field_z * field_z)
+            return {
+                "field_x_mt": field_x,
+                "field_y_mt": field_y,
+                "field_z_mt": field_z,
+                "field_total_mt": total,
+                "freq_hz": 0.0,
+                "temp_c": 0.0,
+                "field_mt": total,
+            }
         except (ValueError, UnicodeDecodeError):
             return None
 
@@ -328,14 +596,31 @@ class CH1600Driver:
     # 数据流控制
     # ------------------------------------------------------------------
 
-    def start_streaming(self) -> None:
-        """启动实时数据流 (DATA?> 或直接读取面板模式流)。"""
+    def start_streaming(self, mode_key: str = "dc_normal", model: str = "") -> None:
+        """启动实时数据流。
+
+        Args:
+            mode_key: 采集模式键，对应 ACQ_MODE_TABLE 中的 key。
+                      根据模式发送对应的硬件启动指令（DATA?> 或 FASTxxx>）。
+            model: 设备型号。若为一维高斯计 ("1d_gauss") 且模式使用 FAST020>，
+                   则自动替换为简写 FAST2>。
+        """
         if self._panel_streaming_mode:
             # 面板模式: 设备已在发送数据, 直接开始读取
             with self._lock:
                 self._streaming = True
             return
-        self._send_command("DATA?")
+
+        # 根据模式选择启动指令
+        from app.config_io import ACQ_MODE_TABLE
+        mode_cfg = ACQ_MODE_TABLE.get(mode_key, {})
+        cmd = mode_cfg.get("start_command", "DATA?>")
+        # 一维高斯计 20Hz 快速模式使用简写 FAST2>
+        if model == "1d_gauss" and cmd == "FAST020>":
+            cmd = mode_cfg.get("fast_1d_command", "FAST2>")
+        # 去掉末尾的 >，_send_command 会自动追加 \r
+        self._send_command(cmd.rstrip(">"))
+
         # 排空启动时的残留缓冲数据，需在锁内访问 _serial
         with self._lock:
             self._streaming = True
@@ -344,6 +629,20 @@ class CH1600Driver:
                     self._serial.read(self._serial.in_waiting)
             except Exception:
                 pass
+
+    def set_sample_rate(self, mode_key: str) -> str:
+        """设置采样速率（发送 FASTxxx> 指令，不启动流）。
+
+        Args:
+            mode_key: 采集模式键。
+
+        Returns:
+            实际发送的指令字符串。
+        """
+        from app.config_io import ACQ_MODE_TABLE
+        cmd = ACQ_MODE_TABLE.get(mode_key, {}).get("start_command", "DATA?>")
+        self._send_command(cmd.rstrip(">"))
+        return cmd
 
     def stop_streaming(self) -> None:
         """停止实时数据流 (DATAC> 或仅标记停止)。"""

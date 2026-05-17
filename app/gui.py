@@ -12,23 +12,28 @@ from __future__ import annotations
 
 import datetime
 import time
+import csv
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QDoubleValidator
+from PyQt5.QtGui import QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenuBar, QMessageBox, QPushButton, QSizePolicy, QSplitter,
-    QStackedWidget, QStatusBar, QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTableWidget, QTableWidgetItem,
+    QTextEdit, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
+import numpy as np
 from data.circular_buffer import CircularBuffer
 from data.recorder import CH1600Recorder
+from data.review_loader import load_review_files, get_review_summary
 from core.command_service import CommandService
 from core.commands import Command, CommandType
+from core.external_ipc import ExternalIPCService
 from app.config_io import ACQ_MODE_TABLE, load_config, save_config
 
 try:
@@ -180,6 +185,8 @@ class GaussMeterGUI(QMainWindow):
             self._cmd_service.log_requested.connect(self._on_log)
             self._cmd_service.command_completed.connect(self._on_command_completed)
             self._cmd_service.command_error.connect(self._on_command_error)
+            if self._ctrl and hasattr(self._ctrl, "driver"):
+                self._ctrl.driver.set_raw_log_callback(self._on_raw_log)
         else:
             self._ctrl = None
 
@@ -196,8 +203,43 @@ class GaussMeterGUI(QMainWindow):
         # 软件零点偏移 (仅主线程读写, 无需加锁)
         self._zero_offset: float = self._cfg.get("acquisition", {}).get("zero_offset", 0.0)
 
+        # 设备模型 (影响表格列数与可用单位)
+        self._device_model = self._cfg.get("device_model", "1d_gauss")
+
+        # 显示单位换算 (独立于设备单位, GUI 层实时换算)
+        self._UNIT_CONVERSION_BY_MODEL = {
+            "1d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
+            "2d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
+            "3d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
+            "fluxmeter": {"mWb": 1.0},
+            "1d_fluxgate": {"nT": 1.0},
+            "3d_fluxgate": {"nT": 1.0},
+        }
+        self._UNIT_CONVERSION = self._UNIT_CONVERSION_BY_MODEL.get(
+            self._device_model, self._UNIT_CONVERSION_BY_MODEL["1d_gauss"]
+        )
+        self._display_unit: str = self._cfg.get("ui", {}).get("display_unit", self._default_unit_for_model())
+
+        # 外部 IPC
+        ipc_cfg = self._cfg.get("external_ipc", {})
+        self._ipc_service = ExternalIPCService(
+            data_pub_port=ipc_cfg.get("zmq_data_port", 5555),
+            cmd_rep_port=ipc_cfg.get("zmq_cmd_port", 5556),
+        )
+        # 注册命令回调
+        self._ipc_service.set_command_callbacks({
+            "start_acquisition": lambda: self._cmd_service and self._cmd_service.start_acquisition(),
+            "stop_acquisition": lambda: self._cmd_service and self._cmd_service.stop_acquisition(),
+            "get_status": self._get_ipc_status,
+        })
+
         # 显示暂停
         self._display_paused = False
+
+        # 图表交互状态
+        self._chart_auto_y = True
+        self._chart_y_min = -1.0
+        self._chart_y_max = 1.0
 
         # FPS 跟踪
         self._display_fps = 0.0
@@ -217,6 +259,11 @@ class GaussMeterGUI(QMainWindow):
         self._display_timer.timeout.connect(self._on_display_tick)
         self._display_timer.start(max(16, display_ms))  # 最低 ~60 FPS cap
 
+        # 记录统计定时器
+        self._rec_stats_timer = QTimer(self)
+        self._rec_stats_timer.timeout.connect(self._update_rec_stats)
+        self._rec_stats_timer.setInterval(1000)
+
         # 初始化全局状态栏
         self._update_global_bar(False, False)
 
@@ -226,6 +273,19 @@ class GaussMeterGUI(QMainWindow):
         if idx >= 0:
             self._sample_rate_combo.setCurrentIndex(idx)
         self._on_acq_mode_changed()
+
+        # 恢复保存的显示单位
+        saved_unit = self._cfg.get("ui", {}).get("display_unit", self._default_unit_for_model())
+        unit_idx = self._display_unit_combo.findText(saved_unit)
+        if unit_idx >= 0:
+            self._display_unit_combo.setCurrentIndex(unit_idx)
+        else:
+            self._display_unit_combo.setCurrentIndex(0)
+            self._display_unit = self._display_unit_combo.currentText()
+
+        # 数据回看
+        self._review_data: Optional[np.ndarray] = None
+        self._review_file_paths: List[Path] = []
 
         self.log("[GUI] CH-1600 高斯计控制程序已启动")
 
@@ -260,7 +320,9 @@ class GaussMeterGUI(QMainWindow):
             ("连接 / Connection", 0),
             ("参数设置 / Parameters", 1),
             ("实时数据 / Live Data", 2),
-            ("日志 / Log", 3),
+            ("数据回看 / Data Review", 3),
+            ("调试 / Debug", 4),
+            ("日志 / Log", 5),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -272,6 +334,8 @@ class GaussMeterGUI(QMainWindow):
         self._pages.addWidget(self._build_connection_page())
         self._pages.addWidget(self._build_param_page())
         self._pages.addWidget(self._build_live_data_page())
+        self._pages.addWidget(self._build_review_page())
+        self._pages.addWidget(self._build_debug_page())
         self._pages.addWidget(self._build_log_page())
 
         splitter.addWidget(self._nav_tree)
@@ -363,6 +427,12 @@ class GaussMeterGUI(QMainWindow):
             self._global_info.setText(f"{unit} | {rng} | {short_label}")
         else:
             self._global_info.setText("未连接")
+
+    def _get_ipc_status(self) -> dict:
+        return {
+            "connected": self._ctrl.is_connected if self._ctrl else False,
+            "streaming": self._ctrl.is_streaming if self._ctrl else False,
+        }
 
     # ==================================================================
     # 页面 0: 连接
@@ -486,9 +556,10 @@ class GaussMeterGUI(QMainWindow):
             "  &nbsp;&nbsp;DC 直流 → AC 低频 (ACL) → AC 中高频 (ACH) → DC ...<br>"
             "  <i>切换后请在上方手动同步选择对应模式。</i><br>"
             "<br>"
-            "<b>▶ 采集速率调节：</b><br>"
-            "  按前面板 <b>[Menu]</b> 键进入菜单 → 找到采集速度选项 →<br>"
-            "  &nbsp;&nbsp;用 ▲▼ 键选择目标速率 → 按 Enter 确认 → 选择 Exit 退出。<br>"
+            "<b>▶ 采集速率调节（已支持软件远程切换）：</b><br>"
+            "  软件可直接通过 RS-232 发送 FASTxxx> 指令切换采样速率。<br>"
+            "  常速: DATA?> | 20Hz: FAST020> | 50Hz: FAST050> | 100Hz: FAST100><br>"
+            "  200Hz: FAST200> | 200+Hz: FAST300><br>"
             "  <i>出厂默认：常速 (~4-10 Hz, 最高精度 ±0.00001 mT)。</i><br>"
             "  <i>速率越高精度越低，详见说明书表 4-2。</i><br>"
             "<br>"
@@ -516,15 +587,21 @@ class GaussMeterGUI(QMainWindow):
         self._unit_btn.setEnabled(False)
         g1.addWidget(self._unit_btn, 0, 2)
 
-        g1.addWidget(QLabel("当前量程:"), 1, 0)
+        g1.addWidget(QLabel("显示单位:"), 1, 0)
+        self._display_unit_combo = QComboBox()
+        self._display_unit_combo.addItems(self._get_display_unit_options(self._device_model))
+        self._display_unit_combo.currentTextChanged.connect(self._on_display_unit_changed)
+        g1.addWidget(self._display_unit_combo, 1, 1)
+
+        g1.addWidget(QLabel("当前量程:"), 2, 0)
         self._range_label = QLabel("--")
         self._range_label.setObjectName("smallData")
-        g1.addWidget(self._range_label, 1, 1)
+        g1.addWidget(self._range_label, 2, 1)
 
         self._range_btn = QPushButton("切换量程 / Cycle Range")
         self._range_btn.clicked.connect(self._on_cycle_range)
         self._range_btn.setEnabled(False)
-        g1.addWidget(self._range_btn, 1, 2)
+        g1.addWidget(self._range_btn, 2, 2)
 
         layout.addWidget(grp1)
 
@@ -576,6 +653,43 @@ class GaussMeterGUI(QMainWindow):
 
         g3.addStretch()
         layout.addWidget(grp3)
+
+        # ── 外部集成 / External IPC ──
+        ipc_cfg = self._cfg.get("external_ipc", {})
+        ipc_grp = QGroupBox("外部集成 / External IPC")
+        ipc_v = QVBoxLayout(ipc_grp)
+
+        ipc_mode_row = QHBoxLayout()
+        self._ipc_enabled_cb = QCheckBox("启用 ZMQ 广播 / Enable ZMQ")
+        self._ipc_enabled_cb.setChecked(
+            ipc_cfg.get("enabled", False) and ipc_cfg.get("mode", "zmq") == "zmq"
+        )
+        ipc_mode_row.addWidget(self._ipc_enabled_cb)
+
+        self._ipc_namedpipe_cb = QCheckBox("启用 NamedPipe / Enable NamedPipe")
+        self._ipc_namedpipe_cb.setChecked(
+            ipc_cfg.get("enabled", False) and ipc_cfg.get("mode", "zmq") == "namedpipe"
+        )
+        ipc_mode_row.addWidget(self._ipc_namedpipe_cb)
+        ipc_mode_row.addStretch()
+        ipc_v.addLayout(ipc_mode_row)
+
+        ipc_port_row = QHBoxLayout()
+        ipc_port_row.addWidget(QLabel("ZMQ 数据端口 / Data Port:"))
+        self._ipc_data_port_spin = QSpinBox()
+        self._ipc_data_port_spin.setRange(1024, 65535)
+        self._ipc_data_port_spin.setValue(ipc_cfg.get("zmq_data_port", 5555))
+        ipc_port_row.addWidget(self._ipc_data_port_spin)
+
+        ipc_port_row.addWidget(QLabel("ZMQ 命令端口 / Cmd Port:"))
+        self._ipc_cmd_port_spin = QSpinBox()
+        self._ipc_cmd_port_spin.setRange(1024, 65535)
+        self._ipc_cmd_port_spin.setValue(ipc_cfg.get("zmq_cmd_port", 5556))
+        ipc_port_row.addWidget(self._ipc_cmd_port_spin)
+        ipc_port_row.addStretch()
+        ipc_v.addLayout(ipc_port_row)
+
+        layout.addWidget(ipc_grp)
 
         layout.addStretch()
         return page
@@ -631,6 +745,31 @@ class GaussMeterGUI(QMainWindow):
         num_row.addLayout(temp_box)
 
         layout.addLayout(num_row)
+
+        # ── 阈值状态显示 ──
+        judge_grp = QGroupBox("阈值判断 / Threshold Judge")
+        judge_grp.setObjectName("judgeGroup")
+        jv = QHBoxLayout(judge_grp)
+
+        self._judge_status_label = QLabel("未启用 / Disabled")
+        self._judge_status_label.setObjectName("smallData")
+        self._judge_status_label.setAlignment(Qt.AlignCenter)
+        self._judge_status_label.setMinimumWidth(120)
+        jv.addWidget(self._judge_status_label)
+
+        self._judge_mode_combo = QComboBox()
+        self._judge_mode_combo.addItems(["闭区间 / Closed", "开区间 / Open"])
+        self._judge_mode_combo.setToolTip(
+            "闭区间: 值在[下限,上限]内为OK; 开区间: 值在(下限,上限)内为NG"
+        )
+        jv.addWidget(self._judge_mode_combo)
+
+        self._judge_abs_cb = QCheckBox("ABS 绝对值 / Absolute")
+        self._judge_abs_cb.setToolTip("先取绝对值再判断")
+        jv.addWidget(self._judge_abs_cb)
+
+        jv.addStretch()
+        layout.addWidget(judge_grp)
 
         # 流控制按钮行 1: 采集 + 归零
         ctrl_row = QHBoxLayout()
@@ -690,11 +829,14 @@ class GaussMeterGUI(QMainWindow):
             self._plot_widget.setClipToView(True)
             self._plot_widget.setAntialiasing(False)
 
+            field_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("field", "#0080c8")
+            freq_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("freq", "#00a651")
+            line_width = self._cfg.get("ui", {}).get("chart_line_width", 2)
             self._field_curve = self._plot_widget.plot(
-                pen=pg.mkPen("#0080c8", width=1.5), name="磁场/mT"
+                pen=pg.mkPen(field_color, width=line_width), name="磁场/mT"
             )
             self._freq_curve = self._plot_widget.plot(
-                pen=pg.mkPen("#00a651", width=1.0), name="频率/Hz"
+                pen=pg.mkPen(freq_color, width=line_width), name="频率/Hz"
             )
             self._freq_curve.setVisible(False)
 
@@ -716,13 +858,74 @@ class GaussMeterGUI(QMainWindow):
         self._show_freq_cb = QCheckBox("显示频率曲线 / Show Frequency")
         self._show_freq_cb.toggled.connect(self._on_toggle_freq_curve)
         chk_row.addWidget(self._show_freq_cb)
-
-        self._auto_y_cb = QCheckBox("自动 Y 轴范围 / Auto Y Range")
-        self._auto_y_cb.setChecked(True)
-        chk_row.addWidget(self._auto_y_cb)
-
         chk_row.addStretch()
         layout.addLayout(chk_row)
+
+        # 图表配置区
+        chart_cfg_grp = QGroupBox("图表配置 / Chart Config")
+        cfg_g = QGridLayout(chart_cfg_grp)
+
+        # 曲线颜色
+        cfg_g.addWidget(QLabel("曲线颜色 / Curve Colors:"), 0, 0)
+        color_row = QHBoxLayout()
+        self._field_color_btn = QPushButton("磁场颜色 / Field Color")
+        self._field_color_btn.clicked.connect(self._on_field_color)
+        color_row.addWidget(self._field_color_btn)
+        self._freq_color_btn = QPushButton("频率颜色 / Freq Color")
+        self._freq_color_btn.clicked.connect(self._on_freq_color)
+        color_row.addWidget(self._freq_color_btn)
+        cfg_g.addLayout(color_row, 0, 1)
+
+        # 线宽
+        cfg_g.addWidget(QLabel("线宽 / Line Width:"), 1, 0)
+        self._line_width_slider = QSlider(Qt.Horizontal)
+        self._line_width_slider.setRange(1, 5)
+        default_width = self._cfg.get("ui", {}).get("chart_line_width", 2)
+        self._line_width_slider.setValue(default_width)
+        self._line_width_slider.valueChanged.connect(self._on_line_width_changed)
+        cfg_g.addWidget(self._line_width_slider, 1, 1)
+
+        # 历史点数
+        cfg_g.addWidget(QLabel("历史点数 / History:"), 2, 0)
+        self._history_slider = QSlider(Qt.Horizontal)
+        self._history_slider.setRange(1000, 20000)
+        self._history_slider.setSingleStep(1000)
+        self._history_slider.setPageStep(1000)
+        default_hist = self._cfg.get("ui", {}).get("chart_history_points", 5000)
+        self._history_slider.setValue(default_hist)
+        self._history_slider.valueChanged.connect(self._on_history_points_changed)
+        cfg_g.addWidget(self._history_slider, 2, 1)
+
+        # Y 轴范围
+        y_row = QHBoxLayout()
+        self._auto_y_cb = QCheckBox("自动 Y 轴 / Auto Y Range")
+        self._auto_y_cb.setChecked(True)
+        self._auto_y_cb.toggled.connect(self._on_auto_y_toggled)
+        y_row.addWidget(self._auto_y_cb)
+
+        self._y_min_edit = QLineEdit(str(self._chart_y_min))
+        self._y_min_edit.setFixedWidth(80)
+        self._y_min_edit.setEnabled(False)
+        self._y_min_edit.editingFinished.connect(self._on_y_range_changed)
+        y_row.addWidget(QLabel("Min:"))
+        y_row.addWidget(self._y_min_edit)
+
+        self._y_max_edit = QLineEdit(str(self._chart_y_max))
+        self._y_max_edit.setFixedWidth(80)
+        self._y_max_edit.setEnabled(False)
+        self._y_max_edit.editingFinished.connect(self._on_y_range_changed)
+        y_row.addWidget(QLabel("Max:"))
+        y_row.addWidget(self._y_max_edit)
+
+        y_row.addStretch()
+        cfg_g.addLayout(y_row, 3, 0, 1, 2)
+
+        # 保存配置按钮
+        save_cfg_btn = QPushButton("保存图表配置 / Save Chart Config")
+        save_cfg_btn.clicked.connect(self._on_save_chart_config)
+        cfg_g.addWidget(save_cfg_btn, 4, 0, 1, 2, alignment=Qt.AlignLeft)
+
+        layout.addWidget(chart_cfg_grp)
 
         # 图表控制按钮行 (清除 / 暂停 / 保存)
         chart_btn_row = QHBoxLayout()
@@ -743,6 +946,38 @@ class GaussMeterGUI(QMainWindow):
         chart_btn_row.addStretch()
         layout.addLayout(chart_btn_row)
 
+        # ── 实时数据表格 ──
+        table_grp = QGroupBox("实时数据表格 / Live Data Table")
+        table_grp.setCheckable(True)
+        table_grp.setChecked(False)
+        tv = QVBoxLayout(table_grp)
+
+        self._data_table = QTableWidget()
+        columns = self._get_table_columns(self._device_model)
+        self._data_table.setColumnCount(len(columns))
+        self._data_table.setHorizontalHeaderLabels(columns)
+        self._data_table.horizontalHeader().setStretchLastSection(True)
+        self._data_table.setMaximumHeight(200)
+        self._data_table.setAlternatingRowColors(True)
+        tv.addWidget(self._data_table)
+
+        table_ctrl = QHBoxLayout()
+        self._table_max_rows_spin = QSpinBox()
+        self._table_max_rows_spin.setRange(100, 5000)
+        self._table_max_rows_spin.setValue(1000)
+        self._table_max_rows_spin.setSuffix(" 行")
+        self._table_max_rows_spin.setToolTip("表格最大保留行数")
+        table_ctrl.addWidget(QLabel("最大行数:"))
+        table_ctrl.addWidget(self._table_max_rows_spin)
+
+        clear_table_btn = QPushButton("清空表格 / Clear Table")
+        clear_table_btn.clicked.connect(self._on_clear_data_table)
+        table_ctrl.addWidget(clear_table_btn)
+        table_ctrl.addStretch()
+        tv.addLayout(table_ctrl)
+
+        layout.addWidget(table_grp)
+
         # ── 数据记录组 (可折叠) ──
         rec_grp = QGroupBox("数据记录 / Recording")
         rec_grp.setCheckable(True)
@@ -761,6 +996,37 @@ class GaussMeterGUI(QMainWindow):
         dir_row.addWidget(browse_btn)
         rv.addLayout(dir_row)
 
+        # 文件轮转配置
+        rollover_row = QHBoxLayout()
+        rollover_row.addWidget(QLabel("文件大小上限 / Max Size:"))
+        self._max_size_spin = QSpinBox()
+        self._max_size_spin.setRange(10, 1000)
+        self._max_size_spin.setSuffix(" MB")
+        self._max_size_spin.setValue(
+            self._cfg.get("acquisition", {}).get("max_file_size_mb", 100)
+        )
+        rollover_row.addWidget(self._max_size_spin)
+
+        rollover_row.addWidget(QLabel("行数上限 / Max Rows:"))
+        self._max_rows_spin = QSpinBox()
+        self._max_rows_spin.setRange(1000, 1000000)
+        self._max_rows_spin.setSuffix(" 行")
+        self._max_rows_spin.setValue(
+            self._cfg.get("acquisition", {}).get("max_file_rows", 100000)
+        )
+        rollover_row.addWidget(self._max_rows_spin)
+
+        rollover_row.addWidget(QLabel("超限策略 / Strategy:"))
+        self._strategy_combo = QComboBox()
+        self._strategy_combo.addItems(["new_file", "stop"])
+        self._strategy_combo.setCurrentText(
+            self._cfg.get("acquisition", {}).get("rollover_strategy", "new_file")
+        )
+        rollover_row.addWidget(self._strategy_combo)
+
+        rollover_row.addStretch()
+        rv.addLayout(rollover_row)
+
         # 记录控制按钮
         rec_ctrl_row = QHBoxLayout()
         self._rec_start_btn = QPushButton("开始记录 / Start Recording")
@@ -774,6 +1040,17 @@ class GaussMeterGUI(QMainWindow):
         self._rec_stop_btn.clicked.connect(self._on_stop_recording)
         self._rec_stop_btn.setEnabled(False)
         rec_ctrl_row.addWidget(self._rec_stop_btn)
+
+        rec_ctrl_row.addSpacing(16)
+
+        export_excel_btn = QPushButton("导出 Excel / Export Excel")
+        export_excel_btn.clicked.connect(self._on_export_excel)
+        rec_ctrl_row.addWidget(export_excel_btn)
+
+        export_txt_btn = QPushButton("导出 TXT / Export TXT")
+        export_txt_btn.clicked.connect(self._on_export_txt)
+        rec_ctrl_row.addWidget(export_txt_btn)
+
         rec_ctrl_row.addStretch()
         rv.addLayout(rec_ctrl_row)
 
@@ -786,8 +1063,306 @@ class GaussMeterGUI(QMainWindow):
         return page
 
     # ==================================================================
-    # 页面 3: 日志
+    # 页面 3: 数据回看
     # ==================================================================
+
+    def _build_review_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("数据回看 / Data Review")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        # 文件选择区
+        file_grp = QGroupBox("文件选择 / File Selection")
+        file_layout = QHBoxLayout(file_grp)
+        self._review_select_btn = QPushButton("选择文件 / Select Files")
+        self._review_select_btn.clicked.connect(self._on_select_review_files)
+        file_layout.addWidget(self._review_select_btn)
+
+        self._review_file_info = QLabel("未选择文件 / No files selected")
+        file_layout.addWidget(self._review_file_info)
+        file_layout.addStretch()
+
+        self._review_append_btn = QPushButton("追加文件 / Append Files")
+        self._review_append_btn.clicked.connect(self._on_append_review_files)
+        file_layout.addWidget(self._review_append_btn)
+
+        self._review_clear_btn = QPushButton("清空 / Clear")
+        self._review_clear_btn.setObjectName("dangerBtn")
+        self._review_clear_btn.clicked.connect(self._on_clear_review)
+        file_layout.addWidget(self._review_clear_btn)
+
+        layout.addWidget(file_grp)
+
+        # 统计信息区
+        stats_grp = QGroupBox("统计信息 / Statistics")
+        stats_layout = QGridLayout(stats_grp)
+
+        self._review_stat_count = QLabel("--")
+        self._review_stat_duration = QLabel("--")
+        self._review_stat_min = QLabel("--")
+        self._review_stat_max = QLabel("--")
+        self._review_stat_mean = QLabel("--")
+
+        stats_layout.addWidget(QLabel("数据点数 / Count:"), 0, 0)
+        stats_layout.addWidget(self._review_stat_count, 0, 1)
+        stats_layout.addWidget(QLabel("时长 / Duration:"), 0, 2)
+        stats_layout.addWidget(self._review_stat_duration, 0, 3)
+
+        stats_layout.addWidget(QLabel("磁场最小值 / Field Min:"), 1, 0)
+        stats_layout.addWidget(self._review_stat_min, 1, 1)
+        stats_layout.addWidget(QLabel("磁场最大值 / Field Max:"), 1, 2)
+        stats_layout.addWidget(self._review_stat_max, 1, 3)
+
+        stats_layout.addWidget(QLabel("磁场平均值 / Field Mean:"), 2, 0)
+        stats_layout.addWidget(self._review_stat_mean, 2, 1)
+
+        stats_layout.setColumnStretch(1, 1)
+        stats_layout.setColumnStretch(3, 1)
+        layout.addWidget(stats_grp)
+
+        # 图表区
+        if _HAS_PYG:
+            self._review_plot_widget = pg.PlotWidget()
+            self._review_plot_widget.setLabel("left", "磁场", units="mT")
+            self._review_plot_widget.setLabel("bottom", "时间", units="s")
+            self._review_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+            self._review_plot_widget.setMinimumHeight(300)
+
+            self._review_field_curve = self._review_plot_widget.plot(
+                pen=pg.mkPen("#0080c8", width=1.5), name="磁场/mT"
+            )
+
+            # 右侧Y轴用于频率
+            plot_item = self._review_plot_widget.getPlotItem()
+            self._review_freq_axis = pg.AxisItem("right")
+            plot_item.layout.addItem(self._review_freq_axis, 2, 3)
+            self._review_freq_vb = pg.ViewBox()
+            plot_item.scene().addItem(self._review_freq_vb)
+            self._review_freq_axis.linkToView(self._review_freq_vb)
+            self._review_freq_vb.setXLink(plot_item)
+
+            self._review_freq_curve = pg.PlotCurveItem(
+                pen=pg.mkPen("#00a651", width=1.0), name="频率/Hz"
+            )
+            self._review_freq_vb.addItem(self._review_freq_curve)
+
+            def _update_review_freq_view():
+                self._review_freq_vb.setGeometry(plot_item.vb.sceneBoundingRect())
+                self._review_freq_vb.linkedViewChanged(plot_item.vb, self._review_freq_vb.XAxis)
+
+            plot_item.vb.sigResized.connect(_update_review_freq_view)
+
+            layout.addWidget(self._review_plot_widget, 1)
+        else:
+            self._review_plot_widget = None
+            no_plot = QLabel("pyqtgraph 未安装, 图表不可用 / pyqtgraph not installed")
+            no_plot.setAlignment(Qt.AlignCenter)
+            layout.addWidget(no_plot, 1)
+
+        # 控制区
+        ctrl_row = QHBoxLayout()
+        self._review_show_freq_cb = QCheckBox("显示频率曲线 / Show Frequency")
+        self._review_show_freq_cb.toggled.connect(self._update_review_plot)
+        ctrl_row.addWidget(self._review_show_freq_cb)
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        return page
+
+    def _update_review_file_info(self) -> None:
+        count = len(self._review_file_paths)
+        total_size = 0
+        for p in self._review_file_paths:
+            try:
+                total_size += p.stat().st_size
+            except OSError:
+                pass
+        if total_size < 1024:
+            size_str = f"{total_size} B"
+        elif total_size < 1024 * 1024:
+            size_str = f"{total_size / 1024:.1f} KB"
+        else:
+            size_str = f"{total_size / (1024 * 1024):.1f} MB"
+        self._review_file_info.setText(f"{count} 个文件 / {size_str}")
+
+    def _on_select_review_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择数据文件 / Select Data Files", "",
+            "数据文件 (*.csv *.txt);;所有文件 (*.*)"
+        )
+        if not files:
+            return
+        paths = [Path(f) for f in files]
+        data, ok_count = load_review_files(paths)
+        if ok_count == 0:
+            QMessageBox.warning(self, "加载失败", "未能成功加载任何文件。\nNo file loaded successfully.")
+            return
+        self._review_data = data
+        self._review_file_paths = list(dict.fromkeys(paths))
+        self._update_review_file_info()
+        self._update_review_plot()
+        self._update_review_stats()
+        self.log(f"[GUI] 数据回看: 已加载 {ok_count} 个文件, {len(data)} 个点")
+
+    def _on_append_review_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "追加数据文件 / Append Data Files", "",
+            "数据文件 (*.csv *.txt);;所有文件 (*.*)"
+        )
+        if not files:
+            return
+        paths = [Path(f) for f in files]
+        new_data, ok_count = load_review_files(paths)
+        if ok_count == 0:
+            QMessageBox.warning(self, "加载失败", "未能成功加载任何文件。\nNo file loaded successfully.")
+            return
+        if self._review_data is not None and len(self._review_data) > 0:
+            combined = np.concatenate([self._review_data, new_data])
+            combined.sort(order="timestamp_s")
+            _, unique_idx = np.unique(combined["timestamp_s"], return_index=True)
+            self._review_data = combined[np.sort(unique_idx)]
+        else:
+            self._review_data = new_data
+        self._review_file_paths = list(dict.fromkeys(self._review_file_paths + paths))
+        self._update_review_file_info()
+        self._update_review_plot()
+        self._update_review_stats()
+        self.log(f"[GUI] 数据回看: 已追加 {ok_count} 个文件, 当前共 {len(self._review_data)} 个点")
+
+    def _on_clear_review(self) -> None:
+        self._review_data = None
+        self._review_file_paths = []
+        self._review_file_info.setText("未选择文件 / No files selected")
+        if _HAS_PYG and self._review_plot_widget is not None:
+            self._review_field_curve.clear()
+            self._review_freq_curve.clear()
+        self._update_review_stats()
+        self.log("[GUI] 数据回看: 已清空")
+
+    def _update_review_plot(self) -> None:
+        if not _HAS_PYG or self._review_plot_widget is None:
+            return
+        if self._review_data is None or len(self._review_data) == 0:
+            self._review_field_curve.clear()
+            self._review_freq_curve.clear()
+            return
+
+        ts = self._review_data["timestamp_s"]
+        ts_rel = ts - ts[0]
+        self._review_field_curve.setData(ts_rel, self._review_data["field_mt"])
+
+        if self._review_show_freq_cb.isChecked():
+            self._review_freq_curve.setData(ts_rel, self._review_data["freq_hz"])
+            self._review_freq_axis.setVisible(True)
+            freq = self._review_data["freq_hz"]
+            if len(freq) > 0:
+                margin = max(abs(freq.min()), abs(freq.max())) * 0.1 + 1e-6
+                self._review_freq_vb.setYRange(freq.min() - margin, freq.max() + margin, padding=0)
+        else:
+            self._review_freq_curve.clear()
+            self._review_freq_axis.setVisible(False)
+
+        # 自动缩放磁场轴和X轴
+        self._review_plot_widget.autoRange()
+
+    def _update_review_stats(self) -> None:
+        if self._review_data is None or len(self._review_data) == 0:
+            self._review_stat_count.setText("--")
+            self._review_stat_duration.setText("--")
+            self._review_stat_min.setText("--")
+            self._review_stat_max.setText("--")
+            self._review_stat_mean.setText("--")
+            return
+        summary = get_review_summary(self._review_data)
+        self._review_stat_count.setText(f"{summary['count']:,}")
+        self._review_stat_duration.setText(f"{summary['duration_s']:.3f} s")
+        self._review_stat_min.setText(f"{summary['field_min']:.6f} mT")
+        self._review_stat_max.setText(f"{summary['field_max']:.6f} mT")
+        self._review_stat_mean.setText(f"{summary['field_mean']:.6f} mT")
+
+    # ==================================================================
+    # 页面 4: 调试
+    # ==================================================================
+
+    def _build_debug_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("调试 / Debug")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        rx_grp = QGroupBox("接收 / RX")
+        rx_v = QVBoxLayout(rx_grp)
+        self._debug_rx_text = QTextEdit()
+        self._debug_rx_text.setReadOnly(True)
+        self._debug_rx_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        rx_v.addWidget(self._debug_rx_text)
+        rx_ctrl = QHBoxLayout()
+        self._debug_rx_hex_cb = QCheckBox("Hex 显示")
+        rx_ctrl.addWidget(self._debug_rx_hex_cb)
+        rx_ctrl.addStretch()
+        clear_rx_btn = QPushButton("清除 / Clear")
+        clear_rx_btn.clicked.connect(lambda: self._debug_rx_text.clear())
+        rx_ctrl.addWidget(clear_rx_btn)
+        rx_v.addLayout(rx_ctrl)
+        layout.addWidget(rx_grp)
+
+        tx_grp = QGroupBox("发送 / TX")
+        tx_v = QVBoxLayout(tx_grp)
+        self._debug_tx_input = QLineEdit()
+        self._debug_tx_input.setPlaceholderText("输入指令 (如 DATA?>)...")
+        tx_v.addWidget(self._debug_tx_input)
+        tx_ctrl = QHBoxLayout()
+        self._debug_tx_hex_cb = QCheckBox("Hex 模式")
+        tx_ctrl.addWidget(self._debug_tx_hex_cb)
+        send_btn = QPushButton("发送 / Send")
+        send_btn.clicked.connect(self._on_debug_send)
+        tx_ctrl.addWidget(send_btn)
+        tx_ctrl.addStretch()
+        tx_v.addLayout(tx_ctrl)
+        quick_row = QHBoxLayout()
+        for cmd in ["DATA?>", "DATAC>", "DATAS>", "ZERO>", "FAST020>", "FAST100>", "FAST300>"]:
+            btn = QPushButton(cmd)
+            btn.clicked.connect(lambda checked, c=cmd: self._debug_tx_input.setText(c))
+            quick_row.addWidget(btn)
+        quick_row.addStretch()
+        tx_v.addLayout(quick_row)
+        layout.addWidget(tx_grp)
+
+        return page
+
+    def _on_debug_send(self) -> None:
+        if not (self._ctrl and self._ctrl.is_connected):
+            self.log("[DEBUG] 设备未连接"); return
+        text = self._debug_tx_input.text().strip()
+        if not text: return
+        try:
+            if self._debug_tx_hex_cb.isChecked():
+                data = bytes(int(b, 16) for b in text.split())
+                self._ctrl.driver._serial.write(data)
+                self._debug_rx_text.append(f'<span style="color:#00a651;">[TX-Hex] {data.hex(" ")}</span>')
+            else:
+                self._ctrl.driver._send_command(text.rstrip(">"))
+                self._debug_rx_text.append(f'<span style="color:#00a651;">[TX] {text}</span>')
+        except Exception as exc:
+            self.log(f"[DEBUG] 发送失败: {exc}")
+
+    def _on_raw_log(self, direction: str, data: bytes) -> None:
+        if direction == "TX":
+            text = data.decode("ascii", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+            self._debug_rx_text.append(f'<span style="color:#00a651;">[TX] {text}</span>')
+        else:
+            if self._debug_rx_hex_cb.isChecked():
+                text = data.hex(" ")
+            else:
+                text = data.decode("ascii", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+            self._debug_rx_text.append(f'<span style="color:#0080c8;">[RX] {text}</span>')
 
     def _build_log_page(self) -> QWidget:
         page = QWidget()
@@ -903,6 +1478,29 @@ class GaussMeterGUI(QMainWindow):
     # 参数操作
     # ==================================================================
 
+    def _convert_field_display(self, field_mt: float) -> float:
+        """将原始 mT 值按当前显示单位换算。"""
+        conv = self._UNIT_CONVERSION_BY_MODEL.get(self._device_model, {})
+        return field_mt * conv.get(self._display_unit, 1.0)
+
+    def _on_display_unit_changed(self, unit: str) -> None:
+        """显示单位变更: 更新换算系数并保存配置。"""
+        self._display_unit = unit
+        self._cfg.setdefault("ui", {})["display_unit"] = unit
+        save_config(self._cfg)
+        self.log(f"[GUI] 显示单位已切换: {unit}")
+        # 立即刷新当前显示值
+        latest = self._buffer.get_latest("field_mt")
+        if latest != 0.0:
+            mode = self._get_active_acq_mode()
+            dec = mode["decimals"]
+            field_display = self._convert_field_display(latest - self._zero_offset)
+            self._field_label.setText(f"{field_display:.{dec}f} {unit}")
+        # 更新零点偏移标签的单位
+        self._zero_offset_label.setText(
+            f"Zero offset: {self._convert_field_display(self._zero_offset):.4f} {unit}"
+        )
+
     def _on_acq_mode_changed(self) -> None:
         """采集模式变更: 更新图表优化参数 + 模式信息显示。"""
         rate_key = self._sample_rate_combo.currentData()
@@ -930,6 +1528,39 @@ class GaussMeterGUI(QMainWindow):
         if rate_key in ACQ_MODE_TABLE:
             return ACQ_MODE_TABLE[rate_key]
         return ACQ_MODE_TABLE["dc_normal"]
+
+    def _default_unit_for_model(self) -> str:
+        """根据设备模型返回默认显示单位。"""
+        if self._device_model in ("1d_gauss", "2d_gauss", "3d_gauss"):
+            return "mT"
+        elif self._device_model == "fluxmeter":
+            return "mWb"
+        elif self._device_model in ("1d_fluxgate", "3d_fluxgate"):
+            return "nT"
+        else:
+            return "mT"
+
+    def _get_display_unit_options(self, model: str) -> List[str]:
+        """根据设备模型返回可用的显示单位选项。"""
+        if model in ("1d_gauss", "2d_gauss", "3d_gauss"):
+            return ["mT", "G", "Oe", "A/m", "mGs"]
+        elif model == "fluxmeter":
+            return ["mWb"]
+        elif model in ("1d_fluxgate", "3d_fluxgate"):
+            return ["nT"]
+        else:
+            return ["mT", "G", "Oe", "A/m", "mGs"]
+
+    def _get_table_columns(self, model: str) -> List[str]:
+        """根据设备模型返回实时数据表格的列标题。"""
+        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+            return ["序号 / #", "磁场 / Field (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
+        elif model == "2d_gauss":
+            return ["序号 / #", "X (mT)", "Y (mT)", "Total B (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
+        elif model in ("3d_gauss", "3d_fluxgate"):
+            return ["序号 / #", "X (mT)", "Y (mT)", "Z (mT)", "Total B (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
+        else:
+            return ["序号 / #", "磁场 / Field (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
 
     def _on_cycle_unit(self) -> None:
         if self._cmd_service:
@@ -992,15 +1623,20 @@ class GaussMeterGUI(QMainWindow):
         # 从 buffer 取的是已修正值，需加回当前 offset 得到原始仪器值
         field_display = self._buffer.get_latest("field_mt")
         self._zero_offset = field_display + self._zero_offset
-        self._zero_offset_label.setText(f"Zero offset: {self._zero_offset:.4f} mT")
+        offset_display = self._convert_field_display(self._zero_offset)
+        self._zero_offset_label.setText(
+            f"Zero offset: {offset_display:.4f} {self._display_unit}"
+        )
         self._cfg.setdefault("acquisition", {})["zero_offset"] = self._zero_offset
         save_config(self._cfg)
-        self.log(f"[GUI] 设置软件零点偏移: {self._zero_offset:.4f} mT")
+        self.log(
+            f"[GUI] 设置软件零点偏移: {offset_display:.4f} {self._display_unit}"
+        )
 
     def _on_clear_zero(self) -> None:
         """清除零点偏移，恢复原始读数。"""
         self._zero_offset = 0.0
-        self._zero_offset_label.setText("Zero offset: 0.0000 mT")
+        self._zero_offset_label.setText(f"Zero offset: 0.0000 {self._display_unit}")
         self._cfg.setdefault("acquisition", {})["zero_offset"] = 0.0
         save_config(self._cfg)
         self.log("[GUI] 已清除软件零点偏移")
@@ -1008,6 +1644,11 @@ class GaussMeterGUI(QMainWindow):
     # ------------------------------------------------------------------
     # 图表控制操作
     # ------------------------------------------------------------------
+
+    def _on_clear_data_table(self) -> None:
+        """清空实时数据表格。"""
+        self._data_table.setRowCount(0)
+        self.log("[GUI] 数据表格已清空")
 
     def _on_clear_chart(self) -> None:
         """清空图表数据和缓冲区。"""
@@ -1054,6 +1695,69 @@ class GaussMeterGUI(QMainWindow):
             self.log(f"[GUI] 保存图表失败: {exc}")
             QMessageBox.critical(self, "保存失败", str(exc))
 
+    # ------------------------------------------------------------------
+    # 图表配置交互
+    # ------------------------------------------------------------------
+
+    def _on_field_color(self) -> None:
+        if not _HAS_PYG or self._plot_widget is None:
+            return
+        init_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("field", "#0080c8")
+        color = QColorDialog.getColor(QColor(init_color))
+        if color.isValid():
+            hex_color = color.name()
+            width = self._line_width_slider.value()
+            self._field_curve.setPen(pg.mkPen(hex_color, width=width))
+            self._cfg.setdefault("ui", {}).setdefault("chart_colors", {})["field"] = hex_color
+
+    def _on_freq_color(self) -> None:
+        if not _HAS_PYG or self._plot_widget is None:
+            return
+        init_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("freq", "#00a651")
+        color = QColorDialog.getColor(QColor(init_color))
+        if color.isValid():
+            hex_color = color.name()
+            width = self._line_width_slider.value()
+            self._freq_curve.setPen(pg.mkPen(hex_color, width=width))
+            self._cfg.setdefault("ui", {}).setdefault("chart_colors", {})["freq"] = hex_color
+
+    def _on_line_width_changed(self, value: int) -> None:
+        if not _HAS_PYG:
+            return
+        if hasattr(self, '_field_curve') and self._field_curve is not None:
+            field_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("field", "#0080c8")
+            self._field_curve.setPen(pg.mkPen(field_color, width=value))
+        if hasattr(self, '_freq_curve') and self._freq_curve is not None:
+            freq_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("freq", "#00a651")
+            self._freq_curve.setPen(pg.mkPen(freq_color, width=value))
+
+    def _on_history_points_changed(self, value: int) -> None:
+        self._cfg.setdefault("ui", {})["chart_history_points"] = value
+
+    def _on_auto_y_toggled(self, checked: bool) -> None:
+        self._chart_auto_y = checked
+        self._y_min_edit.setEnabled(not checked)
+        self._y_max_edit.setEnabled(not checked)
+        if not checked:
+            self._on_y_range_changed()
+
+    def _on_y_range_changed(self) -> None:
+        try:
+            self._chart_y_min = float(self._y_min_edit.text())
+        except ValueError:
+            pass
+        try:
+            self._chart_y_max = float(self._y_max_edit.text())
+        except ValueError:
+            pass
+
+    def _on_save_chart_config(self) -> None:
+        ui_cfg = self._cfg.setdefault("ui", {})
+        ui_cfg["chart_line_width"] = self._line_width_slider.value()
+        ui_cfg["chart_history_points"] = self._history_slider.value()
+        save_config(self._cfg)
+        self.log("[GUI] 图表配置已保存")
+
     # ==================================================================
     # 数据流操作
     # ==================================================================
@@ -1067,6 +1771,13 @@ class GaussMeterGUI(QMainWindow):
         self._buffer.clear()
         self._update_global_bar(self._ctrl.is_connected if self._ctrl else False, True)
         self.log("[GUI] 数据采集已启动")
+        # 启动外部 IPC
+        if self._ipc_enabled_cb.isChecked():
+            self._ipc_service.start()
+        if self._ipc_namedpipe_cb.isChecked():
+            self._ipc_service.start_namedpipe(
+                self._cfg.get("external_ipc", {}).get("namedpipe_name", "m1600_control")
+            )
 
     def _on_stop_stream(self) -> None:
         if self._cmd_service is None:
@@ -1076,6 +1787,9 @@ class GaussMeterGUI(QMainWindow):
         self._stream_stop_btn.setEnabled(False)
         self._update_global_bar(self._ctrl.is_connected if self._ctrl else False, False)
         self.log("[GUI] 数据采集已停止")
+        # 停止外部 IPC
+        self._ipc_service.stop()
+        self._ipc_service.stop_namedpipe()
 
     # ==================================================================
     # 数据记录操作 (使用 CH1600Recorder)
@@ -1091,12 +1805,19 @@ class GaussMeterGUI(QMainWindow):
             QMessageBox.warning(self, "未在采集", "请先开始数据采集再记录。\nStart acquisition before recording.")
             return
         save_dir = Path(self._save_dir_edit.text())
-        self._recorder = CH1600Recorder(output_dir=save_dir)
+        self._recorder = CH1600Recorder(
+            output_dir=save_dir,
+            max_file_size_mb=self._max_size_spin.value(),
+            max_file_rows=self._max_rows_spin.value(),
+            rollover_strategy=self._strategy_combo.currentText(),
+        )
         try:
             file_path = self._recorder.start()
             self._rec_start_btn.setEnabled(False)
             self._rec_stop_btn.setEnabled(True)
-            self._rec_stats_label.setText(f"记录中: {file_path.name}\n0 行")
+            self._rec_stats_label.setText(f"记录中: {file_path.name} | 0 行 | 0.0 MB")
+            self._rec_stats_label.setStyleSheet("")
+            self._rec_stats_timer.start()
             self._update_global_bar(
                 self._ctrl.is_connected if self._ctrl else False,
                 self._ctrl.is_streaming if self._ctrl else False,
@@ -1107,6 +1828,7 @@ class GaussMeterGUI(QMainWindow):
             self._recorder = None
 
     def _on_stop_recording(self) -> None:
+        self._rec_stats_timer.stop()
         if self._recorder:
             self._recorder.stop()
             row_count = self._recorder.row_count
@@ -1116,14 +1838,170 @@ class GaussMeterGUI(QMainWindow):
         self._rec_start_btn.setEnabled(True)
         self._rec_stop_btn.setEnabled(False)
         self._rec_stats_label.setText("记录已停止")
+        self._rec_stats_label.setStyleSheet("")
         self._update_global_bar(
             self._ctrl.is_connected if self._ctrl else False,
             self._ctrl.is_streaming if self._ctrl else False,
         )
 
+    def _update_rec_stats(self) -> None:
+        """记录统计定时器回调: 更新文件大小、行数, 检测 rollover 停止。"""
+        if not (self._recorder and self._recorder.is_recording):
+            return
+
+        if self._recorder.stopped_by_rollover:
+            self._rec_stats_timer.stop()
+            reason = self._recorder.rollover_reason or "未知"
+            reason_text = {"rows": "行数", "size": "大小"}.get(reason, reason)
+            self._rec_stats_label.setText(f"已停止: 达到上限 (原因: {reason_text})")
+            self._rec_stats_label.setStyleSheet("color: #e04040; font-weight: 700;")
+            self._rec_start_btn.setEnabled(True)
+            self._rec_stop_btn.setEnabled(False)
+            self._recorder = None
+            self._update_global_bar(
+                self._ctrl.is_connected if self._ctrl else False,
+                self._ctrl.is_streaming if self._ctrl else False,
+            )
+            return
+
+        fname = self._recorder.file_path.name if self._recorder.file_path else "?"
+        rows = self._recorder.row_count
+        size_mb = self._recorder.current_file_size_mb
+        self._rec_stats_label.setText(
+            f"记录中: {fname} | {rows:,} 行 | {size_mb:.1f} MB"
+        )
+
+    def _get_export_source(self) -> Tuple[Path, str] | Tuple[None, None]:
+        """返回 (csv_path, suggested_name) 或 (None, None)。"""
+        if self._recorder and self._recorder.file_path:
+            return self._recorder.file_path, self._recorder.file_path.stem
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择 CSV 数据源 / Select CSV", "", "CSV Files (*.csv)"
+        )
+        if file_path:
+            p = Path(file_path)
+            return p, p.stem
+        return None, None
+
+    def _on_export_excel(self) -> None:
+        src, name = self._get_export_source()
+        if src is None:
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出 Excel / Export Excel", f"{name}.xlsx", "Excel Files (*.xlsx)"
+        )
+        if not out:
+            return
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment, Border, Side
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "CH1600 Data"
+
+            header_font = Font(name="宋体", size=12, bold=True)
+            header_align = Alignment(horizontal="center", vertical="center")
+            thin_border = Border(
+                left=Side(style="thin"), right=Side(style="thin"),
+                top=Side(style="thin"), bottom=Side(style="thin")
+            )
+
+            with open(src, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for ridx, row in enumerate(reader, start=1):
+                    for cidx, val in enumerate(row, start=1):
+                        cell = ws.cell(row=ridx, column=cidx, value=f"'{val}" if ridx > 1 else val)
+                        cell.border = thin_border
+                        if ridx == 1:
+                            cell.font = header_font
+                            cell.alignment = header_align
+
+            wb.save(out)
+            self.log(f"[GUI] 导出 Excel 成功: {out}")
+            QMessageBox.information(self, "导出成功", f"已保存到:\n{out}")
+        except Exception as exc:
+            self.log(f"[GUI] 导出 Excel 失败: {exc}")
+            QMessageBox.critical(self, "导出失败", str(exc))
+
+    def _on_export_txt(self) -> None:
+        src, name = self._get_export_source()
+        if src is None:
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出 TXT / Export TXT", f"{name}.txt", "Text Files (*.txt)"
+        )
+        if not out:
+            return
+        try:
+            with open(src, "r", encoding="utf-8-sig", newline="") as f_in:
+                reader = csv.reader(f_in)
+                with open(out, "w", encoding="utf-8-sig", newline="") as f_out:
+                    writer = csv.writer(f_out, delimiter="\t")
+                    for row in reader:
+                        writer.writerow(row)
+            self.log(f"[GUI] 导出 TXT 成功: {out}")
+            QMessageBox.information(self, "导出成功", f"已保存到:\n{out}")
+        except Exception as exc:
+            self.log(f"[GUI] 导出 TXT 失败: {exc}")
+            QMessageBox.critical(self, "导出失败", str(exc))
+
     # ==================================================================
     # 信号处理 — 来自 CommandService 的广播
     # ==================================================================
+
+    def _update_judge_status(self, field_mt: float) -> None:
+        """阈值判断: 根据上下限和判断模式更新状态标签。"""
+        try:
+            up = float(self._up_thresh_edit.text())
+            low = float(self._low_thresh_edit.text())
+        except ValueError:
+            self._judge_status_label.setText("未启用 / Disabled")
+            self._judge_status_label.setStyleSheet("background-color: #f0f0f0; color: #666;")
+            return
+
+        # 如果上下限都为 0，视为未启用
+        if up == 0.0 and low == 0.0:
+            self._judge_status_label.setText("未启用 / Disabled")
+            self._judge_status_label.setStyleSheet("background-color: #f0f0f0; color: #666;")
+            return
+
+        # ABS 模式
+        val = abs(field_mt) if self._judge_abs_cb.isChecked() else field_mt
+        low_v = abs(low) if self._judge_abs_cb.isChecked() else low
+        up_v = abs(up) if self._judge_abs_cb.isChecked() else up
+
+        # 确保 low <= up
+        if low_v > up_v:
+            low_v, up_v = up_v, low_v
+
+        in_range = low_v <= val <= up_v
+        is_open = self._judge_mode_combo.currentIndex() == 1  # 1 = 开区间
+
+        if is_open:
+            # 开区间: 范围内 = NG, 范围外 = OK
+            if in_range:
+                self._judge_status_label.setText("NG")
+                self._judge_status_label.setStyleSheet(
+                    "background-color: #e04040; color: #ffffff; font-weight: 700; border-radius: 4px; padding: 4px 12px;"
+                )
+            else:
+                self._judge_status_label.setText("OK")
+                self._judge_status_label.setStyleSheet(
+                    "background-color: #00a651; color: #ffffff; font-weight: 700; border-radius: 4px; padding: 4px 12px;"
+                )
+        else:
+            # 闭区间: 范围内 = OK, 范围外 = NG
+            if in_range:
+                self._judge_status_label.setText("OK")
+                self._judge_status_label.setStyleSheet(
+                    "background-color: #00a651; color: #ffffff; font-weight: 700; border-radius: 4px; padding: 4px 12px;"
+                )
+            else:
+                self._judge_status_label.setText("NG")
+                self._judge_status_label.setStyleSheet(
+                    "background-color: #e04040; color: #ffffff; font-weight: 700; border-radius: 4px; padding: 4px 12px;"
+                )
 
     def _on_stream_batch(self, batch: dict) -> None:
         """批量数据: 应用零偏、更新数值显示、推入 CircularBuffer、CSV 记录。"""
@@ -1136,14 +2014,14 @@ class GaussMeterGUI(QMainWindow):
             offset = self._zero_offset
             points = [{**p, "field_mt": p.get("field_mt", 0.0) - offset} for p in points]
 
-        # 用批量中的最新点更新数值显示 (精度跟随当前采集模式)
+        # 用批量中的最新点更新数值显示 (精度跟随当前采集模式, 按显示单位换算)
         latest = batch.get("latest", {})
         if latest:
             mode = self._get_active_acq_mode()
             dec = mode["decimals"]
             field_raw = latest.get("field_mt", 0)
-            field_display = field_raw - self._zero_offset
-            self._field_label.setText(f"{field_display:.{dec}f} mT")
+            field_display = self._convert_field_display(field_raw - self._zero_offset)
+            self._field_label.setText(f"{field_display:.{dec}f} {self._display_unit}")
 
             freq = latest.get("freq_hz", 0)
             if freq < 0.01:
@@ -1152,6 +2030,9 @@ class GaussMeterGUI(QMainWindow):
                 self._freq_label.setText(f"{freq:.0f} Hz")
 
             self._temp_label.setText(f"{latest.get('temp_c', 0):.1f} °C")
+
+            # 阈值判断
+            self._update_judge_status(field_raw - self._zero_offset)
 
         self._total_points += len(points)
 
@@ -1166,12 +2047,62 @@ class GaussMeterGUI(QMainWindow):
             timestamps,
         )
 
+        # 更新实时数据表格
+        if self._data_table.isVisible():
+            max_rows = self._table_max_rows_spin.value()
+            for i, p in enumerate(points):
+                row = self._data_table.rowCount()
+                if row >= max_rows:
+                    self._data_table.removeRow(0)
+                    row = max_rows - 1
+                self._data_table.insertRow(row)
+                self._data_table.setItem(row, 0, QTableWidgetItem(str(self._total_points - len(points) + i + 1)))
+                if self._device_model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
+                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
+                    ts = p.get("timestamp_s", 0)
+                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{ts:.6f}"))
+                elif self._device_model == "2d_gauss":
+                    self._data_table.setItem(row, 1, QTableWidgetItem("0.000000"))  # X
+                    self._data_table.setItem(row, 2, QTableWidgetItem("0.000000"))  # Y
+                    self._data_table.setItem(row, 3, QTableWidgetItem("0.000000"))  # total_B
+                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
+                    self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
+                    ts = p.get("timestamp_s", 0)
+                    self._data_table.setItem(row, 6, QTableWidgetItem(f"{ts:.6f}"))
+                elif self._device_model in ("3d_gauss", "3d_fluxgate"):
+                    self._data_table.setItem(row, 1, QTableWidgetItem("0.000000"))  # X
+                    self._data_table.setItem(row, 2, QTableWidgetItem("0.000000"))  # Y
+                    self._data_table.setItem(row, 3, QTableWidgetItem("0.000000"))  # Z
+                    self._data_table.setItem(row, 4, QTableWidgetItem("0.000000"))  # total_B
+                    self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
+                    self._data_table.setItem(row, 6, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
+                    ts = p.get("timestamp_s", 0)
+                    self._data_table.setItem(row, 7, QTableWidgetItem(f"{ts:.6f}"))
+                else:
+                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_mt', 0):.6f}"))
+                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
+                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
+                    ts = p.get("timestamp_s", 0)
+                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{ts:.6f}"))
+            self._data_table.scrollToBottom()
+
         # CSV 记录 (使用 CH1600Recorder)
         if self._recorder and self._recorder.is_recording:
             try:
                 self._recorder.write_batch(points)
             except Exception:
                 pass
+
+        # 外部 IPC 广播
+        if latest:
+            self._ipc_service.publish_data(
+                timestamp_s=latest.get("timestamp_s", 0.0),
+                field_total_mt=latest.get("field_mt", 0.0),
+                freq_hz=latest.get("freq_hz", 0.0),
+                temp_c=latest.get("temp_c", 0.0),
+            )
 
     def _on_state_changed(self, state: dict) -> None:
         """设备状态更新。"""
@@ -1238,11 +2169,11 @@ class GaussMeterGUI(QMainWindow):
                 # 固定 X 轴窗口 (滚动视图)
                 self._plot_widget.setXRange(-x_window, 0.5, padding=0)
 
-                # 自动 Y 轴
+                # Y 轴范围
                 if self._auto_y_cb.isChecked():
-                    y_min, y_max = vals.min(), vals.max()
-                    margin = max(abs(y_min), abs(y_max)) * 0.1 + 1e-6
-                    self._plot_widget.setYRange(y_min - margin, y_max + margin, padding=0)
+                    self._plot_widget.autoRange()
+                else:
+                    self._plot_widget.setYRange(self._chart_y_min, self._chart_y_max, padding=0)
 
             # 频率曲线
             if self._show_freq_cb.isChecked():
@@ -1262,13 +2193,7 @@ class GaussMeterGUI(QMainWindow):
         self._global_fps.setText(f"FPS: {self._display_fps:.1f}")
         self._global_pts.setText(f"{self._total_points} pts")
 
-        # 记录统计
-        if self._recorder and self._recorder.is_recording:
-            fname = self._recorder.file_path.name if self._recorder.file_path else "?"
-            self._rec_stats_label.setText(
-                f"记录中: {fname}\n"
-                f"已记录: {self._recorder.row_count} 行"
-            )
+        # 记录统计由 _update_rec_stats 定时器处理
 
     def _on_toggle_freq_curve(self, visible: bool) -> None:
         if hasattr(self, '_freq_curve'):
@@ -1292,6 +2217,20 @@ class GaussMeterGUI(QMainWindow):
             self._cmd_service.stop()
         if self._recorder and self._recorder.is_recording:
             self._recorder.stop()
+        self._ipc_service.stop()
+        self._ipc_service.stop_namedpipe()
+        # 保存 IPC 配置
+        try:
+            ipc_cfg = self._cfg.setdefault("external_ipc", {})
+            ipc_cfg["enabled"] = self._ipc_enabled_cb.isChecked() or self._ipc_namedpipe_cb.isChecked()
+            if self._ipc_namedpipe_cb.isChecked():
+                ipc_cfg["mode"] = "namedpipe"
+            elif self._ipc_enabled_cb.isChecked():
+                ipc_cfg["mode"] = "zmq"
+            ipc_cfg["zmq_data_port"] = self._ipc_data_port_spin.value()
+            ipc_cfg["zmq_cmd_port"] = self._ipc_cmd_port_spin.value()
+        except Exception:
+            pass
         # 保存配置
         try:
             save_config(self._cfg)

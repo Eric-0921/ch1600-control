@@ -19,17 +19,19 @@ from typing import Any, Dict, Optional
 
 # 采集模式 → 图表优化映射
 # mode_key: (预期FPS, 数值精度小数位, X轴窗口秒, 降采样因子)
+# 采集模式 → 图表优化映射 + 硬件启动指令
+# mode_key: (预期FPS, 数值精度小数位, X轴窗口秒, 降采样因子, 硬件启动指令)
 ACQ_MODE_TABLE: Dict[str, Dict[str, Any]] = {
-    "dc_normal":   {"label": "DC 常速 (~4-10 Hz)",    "expect_fps": 6,   "decimals": 4, "x_window_s": 60, "downsample": 1, "resolution": "±0.00001 mT", "accuracy": "0.05%"},
-    "dc_20hz":     {"label": "DC 快速 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 20, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%"},
-    "dc_50hz":     {"label": "DC 快速 50 Hz",          "expect_fps": 50,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.015%"},
-    "dc_100hz":    {"label": "DC 高速 100 Hz",         "expect_fps": 100, "decimals": 2, "x_window_s": 5,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%"},
-    "dc_200hz":    {"label": "DC 高速 200 Hz",         "expect_fps": 200, "decimals": 1, "x_window_s": 2,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
-    "dc_200plus":  {"label": "DC 超高速 200+ Hz",      "expect_fps": 250, "decimals": 1, "x_window_s": 1,  "downsample": 6, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
-    "ac_20hz":     {"label": "AC 低频 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%"},
-    "ac_50hz":     {"label": "AC 中高频 50 Hz",        "expect_fps": 50,  "decimals": 2, "x_window_s": 5,  "downsample": 1, "resolution": "±0.01 mT",    "accuracy": "0.015%"},
-    "ac_100hz":    {"label": "AC 中高频 100 Hz",       "expect_fps": 100, "decimals": 2, "x_window_s": 2,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%"},
-    "ac_200hz":    {"label": "AC 中高频 200 Hz",       "expect_fps": 200, "decimals": 1, "x_window_s": 1,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%"},
+    "dc_normal":   {"label": "DC 常速 (~4-10 Hz)",    "expect_fps": 6,   "decimals": 4, "x_window_s": 60, "downsample": 1, "resolution": "±0.00001 mT", "accuracy": "0.05%", "start_command": "DATA?>"},
+    "dc_20hz":     {"label": "DC 快速 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 20, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%", "start_command": "FAST020>", "fast_1d_command": "FAST2>"},
+    "dc_50hz":     {"label": "DC 快速 50 Hz",          "expect_fps": 50,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.015%", "start_command": "FAST050>"},
+    "dc_100hz":    {"label": "DC 高速 100 Hz",         "expect_fps": 100, "decimals": 2, "x_window_s": 5,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%", "start_command": "FAST100>"},
+    "dc_200hz":    {"label": "DC 高速 200 Hz",         "expect_fps": 200, "decimals": 1, "x_window_s": 2,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%", "start_command": "FAST200>"},
+    "dc_200plus":  {"label": "DC 超高速 200+ Hz",      "expect_fps": 250, "decimals": 1, "x_window_s": 1,  "downsample": 6, "resolution": "±0.1 mT",     "accuracy": "0.15%", "start_command": "FAST300>"},
+    "ac_20hz":     {"label": "AC 低频 20 Hz",          "expect_fps": 20,  "decimals": 3, "x_window_s": 10, "downsample": 1, "resolution": "±0.001 mT",   "accuracy": "0.01%", "start_command": "FAST020>", "fast_1d_command": "FAST2>"},
+    "ac_50hz":     {"label": "AC 中高频 50 Hz",        "expect_fps": 50,  "decimals": 2, "x_window_s": 5,  "downsample": 1, "resolution": "±0.01 mT",    "accuracy": "0.015%", "start_command": "FAST050>"},
+    "ac_100hz":    {"label": "AC 中高频 100 Hz",       "expect_fps": 100, "decimals": 2, "x_window_s": 2,  "downsample": 2, "resolution": "±0.01 mT",    "accuracy": "0.02%", "start_command": "FAST100>"},
+    "ac_200hz":    {"label": "AC 中高频 200 Hz",       "expect_fps": 200, "decimals": 1, "x_window_s": 1,  "downsample": 4, "resolution": "±0.1 mT",     "accuracy": "0.15%", "start_command": "FAST200>"},
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -48,6 +50,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_save": False,
         "mode_key": "dc_normal",
         "zero_offset": 0.0,
+        "max_file_size_mb": 100,
+        "max_file_rows": 100000,
+        "rollover_strategy": "new_file",
     },
     "monitor": {
         "interval_ms": 500,
@@ -56,8 +61,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "display_interval_ms": 30,
         "chart_history_points": 5000,
         "chart_downsample": 2,
+        "chart_colors": {"field": "#0080c8", "freq": "#00a651"},
+        "chart_line_width": 2,
         "window_width": 1200,
         "window_height": 800,
+    },
+    "external_ipc": {
+        "enabled": False,
+        "mode": "zmq",
+        "zmq_data_port": 5555,
+        "zmq_cmd_port": 5556,
+        "namedpipe_name": "m1600_control",
     },
 }
 

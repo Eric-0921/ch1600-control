@@ -84,7 +84,7 @@ class InstrumentController(QObject):
     # 数据流 Worker 管理
     # ------------------------------------------------------------------
 
-    def start_streaming(self, batch_size: int = 100) -> None:
+    def start_streaming(self, batch_size: int = 100, mode_key: str = "dc_normal") -> None:
         """启动高速数据流 Worker。"""
         if not self._driver.is_connected:
             self.error_occurred.emit("[Controller] 设备未连接，无法启动数据流")
@@ -93,7 +93,9 @@ class InstrumentController(QObject):
             self.log_requested.emit("[Controller] 数据流已在运行")
             return
 
-        self._stream_worker = CH1600StreamWorker(self._driver, batch_size=batch_size)
+        self._stream_worker = CH1600StreamWorker(
+            self._driver, batch_size=batch_size, mode_key=mode_key
+        )
         self._stream_thread = QThread(self)
 
         self._stream_worker.moveToThread(self._stream_thread)

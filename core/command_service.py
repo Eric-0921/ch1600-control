@@ -254,8 +254,10 @@ class CommandService(QObject):
     def start_acquisition(self) -> None:
         """启动数据采集 (流 + 监控)。必须在主线程调用。"""
         # 直接调用 (创建 QThread 必须在主线程)
+        mode_key = self._cfg.get("acquisition", {}).get("mode_key", "dc_normal")
         self._ctrl.start_streaming(
-            batch_size=self._cfg.get("ch1600", {}).get("stream_batch_size", 100)
+            batch_size=self._cfg.get("ch1600", {}).get("stream_batch_size", 100),
+            mode_key=mode_key,
         )
         self._ctrl.start_monitoring(interval_ms=500)
 

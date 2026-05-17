@@ -32,3 +32,10 @@ config.local.json
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Reverse-engineered binaries & tools (large, generated)
+.tools/
+origin-DataReader2/
+reverse-engineered/
+reverse-engineered-v2/
+reverse-engineered-v2.zip

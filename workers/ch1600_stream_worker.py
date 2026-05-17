@@ -36,11 +36,13 @@ class CH1600StreamWorker(QObject):
         driver: CH1600Driver,
         batch_size: int = 100,
         batch_interval_s: float = 0.030,
+        mode_key: str = "dc_normal",
     ) -> None:
         super().__init__()
         self._driver = driver
         self._batch_size = batch_size
         self._batch_interval_s = batch_interval_s
+        self._mode_key = mode_key
         self._stop_requested = False
         self._read_buffer = b""
         self._point_count = 0
@@ -52,7 +54,7 @@ class CH1600StreamWorker(QObject):
 
         # 启动设备端的实时发送
         try:
-            self._driver.start_streaming()
+            self._driver.start_streaming(self._mode_key)
         except Exception as exc:
             self.error_occurred.emit(f"[CH-1600] 启动数据流失败: {exc}")
             self.finished.emit()
