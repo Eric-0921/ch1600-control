@@ -190,10 +190,20 @@ class GaussMeterGUI(QMainWindow):
         else:
             self._ctrl = None
 
-        # 数据缓冲
+        # 数据缓冲 (通道根据设备型号动态决定)
         buffer_cap = self._cfg.get("ui", {}).get("chart_history_points", 5000)
+        if self._device_model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+            init_channels = ["field_mt", "freq_hz", "temp_c"]
+        elif self._device_model == "2d_gauss":
+            init_channels = ["field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"]
+        elif self._device_model == "3d_gauss":
+            init_channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"]
+        elif self._device_model == "3d_fluxgate":
+            init_channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"]
+        else:
+            init_channels = ["field_mt", "freq_hz", "temp_c"]
         self._buffer = CircularBuffer(
-            channels=["field_mt", "freq_hz", "temp_c"],
+            channels=init_channels,
             capacity=buffer_cap,
         )
 
@@ -534,11 +544,25 @@ class GaussMeterGUI(QMainWindow):
         self._sample_rate_combo.currentIndexChanged.connect(self._on_acq_mode_changed)
         ag.addWidget(self._sample_rate_combo, 1, 1)
 
+        ag.addWidget(QLabel("设备型号 / Device Model:"), 2, 0)
+        self._device_model_combo = QComboBox()
+        self._device_model_combo.addItem("一维高斯计 / 1D Gauss", "1d_gauss")
+        self._device_model_combo.addItem("二维高斯计 / 2D Gauss", "2d_gauss")
+        self._device_model_combo.addItem("三维高斯计 / 3D Gauss", "3d_gauss")
+        self._device_model_combo.addItem("磁通计 / Fluxmeter", "fluxmeter")
+        self._device_model_combo.addItem("一维磁通门计 / 1D Fluxgate", "1d_fluxgate")
+        self._device_model_combo.addItem("三维磁通门计 / 3D Fluxgate", "3d_fluxgate")
+        idx = self._device_model_combo.findData(self._device_model)
+        if idx >= 0:
+            self._device_model_combo.setCurrentIndex(idx)
+        self._device_model_combo.currentIndexChanged.connect(self._on_device_model_changed)
+        ag.addWidget(self._device_model_combo, 2, 1)
+
         # 模式信息
         self._acq_info_label = QLabel()
         self._acq_info_label.setObjectName("smallData")
         self._acq_info_label.setWordWrap(True)
-        ag.addWidget(self._acq_info_label, 2, 0, 1, 2)
+        ag.addWidget(self._acq_info_label, 3, 0, 1, 2)
 
         layout.addWidget(acq_grp)
 
@@ -833,12 +857,26 @@ class GaussMeterGUI(QMainWindow):
             freq_color = self._cfg.get("ui", {}).get("chart_colors", {}).get("freq", "#00a651")
             line_width = self._cfg.get("ui", {}).get("chart_line_width", 2)
             self._field_curve = self._plot_widget.plot(
-                pen=pg.mkPen(field_color, width=line_width), name="磁场/mT"
+                pen=pg.mkPen(field_color, width=line_width), name="Total B"
             )
             self._freq_curve = self._plot_widget.plot(
                 pen=pg.mkPen(freq_color, width=line_width), name="频率/Hz"
             )
             self._freq_curve.setVisible(False)
+
+            # 多通道分量曲线 (2D/3D 模式下使用)
+            self._field_x_curve = self._plot_widget.plot(
+                pen=pg.mkPen("#e04040", width=1), name="X"
+            )
+            self._field_y_curve = self._plot_widget.plot(
+                pen=pg.mkPen("#00a651", width=1), name="Y"
+            )
+            self._field_z_curve = self._plot_widget.plot(
+                pen=pg.mkPen("#f0a000", width=1), name="Z"
+            )
+            self._field_x_curve.setVisible(False)
+            self._field_y_curve.setVisible(False)
+            self._field_z_curve.setVisible(False)
 
             # 零位参考线
             self._zero_line = pg.InfiniteLine(
@@ -1120,6 +1158,11 @@ class GaussMeterGUI(QMainWindow):
         stats_layout.addWidget(QLabel("磁场平均值 / Field Mean:"), 2, 0)
         stats_layout.addWidget(self._review_stat_mean, 2, 1)
 
+        self._review_stat_channels = QLabel("")
+        self._review_stat_channels.setWordWrap(True)
+        self._review_stat_channels.setStyleSheet("font-size: 11px; color: #555;")
+        stats_layout.addWidget(self._review_stat_channels, 3, 0, 1, 4)
+
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
         layout.addWidget(stats_grp)
@@ -1253,9 +1296,11 @@ class GaussMeterGUI(QMainWindow):
 
         ts = self._review_data["timestamp_s"]
         ts_rel = ts - ts[0]
-        self._review_field_curve.setData(ts_rel, self._review_data["field_mt"])
+        # 优先 field_total_mt, 否则回退到 field_mt (兼容旧文件)
+        field_key = "field_total_mt" if "field_total_mt" in (self._review_data.dtype.names or ()) else "field_mt"
+        self._review_field_curve.setData(ts_rel, self._review_data[field_key])
 
-        if self._review_show_freq_cb.isChecked():
+        if self._review_show_freq_cb.isChecked() and "freq_hz" in (self._review_data.dtype.names or ()):
             self._review_freq_curve.setData(ts_rel, self._review_data["freq_hz"])
             self._review_freq_axis.setVisible(True)
             freq = self._review_data["freq_hz"]
@@ -1276,13 +1321,28 @@ class GaussMeterGUI(QMainWindow):
             self._review_stat_min.setText("--")
             self._review_stat_max.setText("--")
             self._review_stat_mean.setText("--")
+            self._review_stat_channels.setText("")
             return
         summary = get_review_summary(self._review_data)
         self._review_stat_count.setText(f"{summary['count']:,}")
         self._review_stat_duration.setText(f"{summary['duration_s']:.3f} s")
-        self._review_stat_min.setText(f"{summary['field_min']:.6f} mT")
-        self._review_stat_max.setText(f"{summary['field_max']:.6f} mT")
-        self._review_stat_mean.setText(f"{summary['field_mean']:.6f} mT")
+        self._review_stat_min.setText(f"{summary['field_min']:.6f}")
+        self._review_stat_max.setText(f"{summary['field_max']:.6f}")
+        self._review_stat_mean.setText(f"{summary['field_mean']:.6f}")
+
+        # 多通道统计摘要
+        ch_lines = []
+        for ch_name, ch_stats in summary.get("channels", {}).items():
+            if ch_name in ("freq_hz", "temp_c"):
+                continue
+            label = {"field_x_mt": "X", "field_y_mt": "Y", "field_z_mt": "Z", "field_total_mt": "Total", "field_mt": "Field"}.get(ch_name, ch_name)
+            ch_lines.append(
+                f"{label}: min={ch_stats['min']:.4f} max={ch_stats['max']:.4f} mean={ch_stats['mean']:.4f}"
+            )
+        if ch_lines:
+            self._review_stat_channels.setText(" | ".join(ch_lines))
+        else:
+            self._review_stat_channels.setText("")
 
     # ==================================================================
     # 页面 4: 调试
@@ -1522,6 +1582,72 @@ class GaussMeterGUI(QMainWindow):
 
         self.log(f"[GUI] 采集模式已切换: {mode['label']}")
 
+    def _on_device_model_changed(self) -> None:
+        """设备型号变更: 更新单位选项、表格列、配置，并提示用户。"""
+        new_model = self._device_model_combo.currentData()
+        if new_model == self._device_model:
+            return
+
+        # 如果正在采集，阻止切换并恢复旧选项
+        if self._ctrl and self._ctrl.is_streaming:
+            QMessageBox.information(
+                self, "采集中", "请先停止数据采集，再切换设备型号。\nStop acquisition before changing device model."
+            )
+            idx = self._device_model_combo.findData(self._device_model)
+            if idx >= 0:
+                self._device_model_combo.setCurrentIndex(idx)
+            return
+
+        self._device_model = new_model
+        self._UNIT_CONVERSION = self._UNIT_CONVERSION_BY_MODEL.get(
+            new_model, self._UNIT_CONVERSION_BY_MODEL["1d_gauss"]
+        )
+
+        # 更新显示单位下拉框
+        self._display_unit_combo.clear()
+        self._display_unit_combo.addItems(self._get_display_unit_options(new_model))
+        default_unit = self._default_unit_for_model()
+        self._display_unit = default_unit
+        self._display_unit_combo.setCurrentText(default_unit)
+
+        # 更新实时数据表格列
+        columns = self._get_table_columns(new_model)
+        self._data_table.clearContents()
+        self._data_table.setRowCount(0)
+        self._data_table.setColumnCount(len(columns))
+        self._data_table.setHorizontalHeaderLabels(columns)
+
+        # 重新初始化环形缓冲区通道
+        self._reinit_buffer_for_model(new_model)
+
+        # 更新图表分量曲线可见性
+        if hasattr(self, '_field_x_curve'):
+            self._field_x_curve.setVisible(new_model in ("2d_gauss", "3d_gauss", "3d_fluxgate"))
+        if hasattr(self, '_field_y_curve'):
+            self._field_y_curve.setVisible(new_model in ("2d_gauss", "3d_gauss", "3d_fluxgate"))
+        if hasattr(self, '_field_z_curve'):
+            self._field_z_curve.setVisible(new_model in ("3d_gauss", "3d_fluxgate"))
+
+        # 保存配置
+        self._cfg["device_model"] = new_model
+        self._cfg.setdefault("ui", {})["display_unit"] = default_unit
+        save_config(self._cfg)
+        self.log(f"[GUI] 设备型号已切换: {new_model}")
+
+    def _reinit_buffer_for_model(self, model: str) -> None:
+        """根据设备型号重新初始化环形缓冲区通道。"""
+        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+            channels = ["field_mt", "freq_hz", "temp_c"]
+        elif model == "2d_gauss":
+            channels = ["field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"]
+        elif model == "3d_gauss":
+            channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"]
+        elif model == "3d_fluxgate":
+            channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"]
+        else:
+            channels = ["field_mt", "freq_hz", "temp_c"]
+        self._buffer = CircularBuffer(channels=channels, capacity=self._buffer.capacity)
+
     def _get_active_acq_mode(self) -> dict:
         """获取当前生效的采集模式参数。"""
         rate_key = self._sample_rate_combo.currentData()
@@ -1654,10 +1780,10 @@ class GaussMeterGUI(QMainWindow):
         """清空图表数据和缓冲区。"""
         self._buffer.clear()
         self._total_points = 0
-        if hasattr(self, '_field_curve') and self._field_curve is not None:
-            self._field_curve.clear()
-        if hasattr(self, '_freq_curve') and self._freq_curve is not None:
-            self._freq_curve.clear()
+        for curve_name in ('_field_curve', '_freq_curve', '_field_x_curve', '_field_y_curve', '_field_z_curve'):
+            curve = getattr(self, curve_name, None)
+            if curve is not None:
+                curve.clear()
         self.log("[GUI] 图表已清除")
 
     def _on_pause_display(self, checked: bool) -> None:
@@ -1671,7 +1797,8 @@ class GaussMeterGUI(QMainWindow):
             self.log("[GUI] 图表显示已恢复")
             # 恢复时立即刷新 Y 轴范围，避免因暂停期间数据变化导致范围过期
             if self._auto_y_cb.isChecked() and hasattr(self, '_field_curve'):
-                _, vals = self._buffer.get("field_mt", max_points=5000, downsample=1)
+                total_ch = "field_mt" if "field_mt" in self._buffer.get_channels() else "field_total_mt"
+                _, vals = self._buffer.get(total_ch, max_points=5000, downsample=1)
                 if len(vals) > 0:
                     y_min, y_max = vals.min(), vals.max()
                     margin = max(abs(y_min), abs(y_max)) * 0.1 + 1e-6
@@ -1951,6 +2078,51 @@ class GaussMeterGUI(QMainWindow):
     # 信号处理 — 来自 CommandService 的广播
     # ==================================================================
 
+    def _update_live_display(self, latest: Dict[str, float], mode: dict, dec: int) -> None:
+        """根据设备型号更新实时数值显示 (Field/Freq/Temp)。"""
+        model = self._device_model
+        unit = self._display_unit
+
+        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+            field_raw = latest.get("field_mt", 0.0)
+            field_display = self._convert_field_display(field_raw - self._zero_offset)
+            self._field_label.setText(f"{field_display:.{dec}f} {unit}")
+            self._update_judge_status(field_raw - self._zero_offset)
+        elif model == "2d_gauss":
+            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
+            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
+            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} B:{t:.{dec}f} {unit}")
+            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
+        elif model == "3d_gauss":
+            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
+            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
+            z = self._convert_field_display(latest.get("field_z_mt", 0.0) - self._zero_offset)
+            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} Z:{z:.{dec}f} B:{t:.{dec}f} {unit}")
+            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
+        elif model == "3d_fluxgate":
+            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
+            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
+            z = self._convert_field_display(latest.get("field_z_mt", 0.0) - self._zero_offset)
+            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} Z:{z:.{dec}f} B:{t:.{dec}f} {unit}")
+            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
+        else:
+            field_raw = latest.get("field_mt", 0.0)
+            field_display = self._convert_field_display(field_raw - self._zero_offset)
+            self._field_label.setText(f"{field_display:.{dec}f} {unit}")
+            self._update_judge_status(field_raw - self._zero_offset)
+
+        freq = latest.get("freq_hz", 0.0)
+        if freq < 0.01:
+            self._freq_label.setText("DC")
+        else:
+            self._freq_label.setText(f"{freq:.0f} Hz")
+
+        temp = latest.get("temp_c", 0.0)
+        self._temp_label.setText(f"{temp:.1f} °C")
+
     def _update_judge_status(self, field_mt: float) -> None:
         """阈值判断: 根据上下限和判断模式更新状态标签。"""
         try:
@@ -2010,43 +2182,33 @@ class GaussMeterGUI(QMainWindow):
         if not points:
             return
 
-        # 应用软件零点偏移
+        # 应用软件零点偏移 (所有 field 分量)
         if self._zero_offset != 0.0:
             offset = self._zero_offset
-            points = [{**p, "field_mt": p.get("field_mt", 0.0) - offset} for p in points]
+            new_points = []
+            for p in points:
+                np_ = dict(p)
+                for k in ("field_mt", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"):
+                    if k in np_:
+                        np_[k] = np_[k] - offset
+                new_points.append(np_)
+            points = new_points
 
-        # 用批量中的最新点更新数值显示 (精度跟随当前采集模式, 按显示单位换算)
+        # 用批量中的最新点更新数值显示
         latest = batch.get("latest", {})
         if latest:
             mode = self._get_active_acq_mode()
             dec = mode["decimals"]
-            field_raw = latest.get("field_mt", 0)
-            field_display = self._convert_field_display(field_raw - self._zero_offset)
-            self._field_label.setText(f"{field_display:.{dec}f} {self._display_unit}")
-
-            freq = latest.get("freq_hz", 0)
-            if freq < 0.01:
-                self._freq_label.setText("DC")
-            else:
-                self._freq_label.setText(f"{freq:.0f} Hz")
-
-            self._temp_label.setText(f"{latest.get('temp_c', 0):.1f} °C")
-
-            # 阈值判断
-            self._update_judge_status(field_raw - self._zero_offset)
+            self._update_live_display(latest, mode, dec)
 
         self._total_points += len(points)
 
         # 推入环形缓冲区 (图表用)
-        field_vals = [p.get("field_mt", 0.0) for p in points]
-        freq_vals = [p.get("freq_hz", 0.0) for p in points]
-        temp_vals = [p.get("temp_c", 0.0) for p in points]
         timestamps = [p.get("timestamp_s", 0.0) for p in points]
-
-        self._buffer.extend(
-            {"field_mt": field_vals, "freq_hz": freq_vals, "temp_c": temp_vals},
-            timestamps,
-        )
+        buffer_data: Dict[str, List[float]] = {}
+        for ch in self._buffer.get_channels():
+            buffer_data[ch] = [p.get(ch, 0.0) for p in points]
+        self._buffer.extend(buffer_data, timestamps)
 
         # 更新实时数据表格
         if self._data_table.isVisible():
@@ -2170,11 +2332,26 @@ class GaussMeterGUI(QMainWindow):
 
         # 图表更新 — 暂停时跳过
         if not self._display_paused:
-            # 磁场曲线
-            ts_arr, vals = self._buffer.get("field_mt", max_points=max_pts, downsample=ds)
+            # 主磁场曲线 (Total B)
+            total_ch = "field_mt" if "field_mt" in self._buffer.get_channels() else "field_total_mt"
+            ts_arr, vals = self._buffer.get(total_ch, max_points=max_pts, downsample=ds)
             if len(ts_arr) > 0:
                 ts_rel = ts_arr - ts_arr[-1]  # 相对时间 (秒)
                 self._field_curve.setData(ts_rel, vals)
+
+                # 多通道分量曲线
+                if "field_x_mt" in self._buffer.get_channels():
+                    ts_x, vx = self._buffer.get("field_x_mt", max_points=max_pts, downsample=ds)
+                    if len(ts_x) > 0:
+                        self._field_x_curve.setData(ts_x - ts_x[-1], vx)
+                if "field_y_mt" in self._buffer.get_channels():
+                    ts_y, vy = self._buffer.get("field_y_mt", max_points=max_pts, downsample=ds)
+                    if len(ts_y) > 0:
+                        self._field_y_curve.setData(ts_y - ts_y[-1], vy)
+                if "field_z_mt" in self._buffer.get_channels():
+                    ts_z, vz = self._buffer.get("field_z_mt", max_points=max_pts, downsample=ds)
+                    if len(ts_z) > 0:
+                        self._field_z_curve.setData(ts_z - ts_z[-1], vz)
 
                 # 固定 X 轴窗口 (滚动视图)
                 self._plot_widget.setXRange(-x_window, 0.5, padding=0)
@@ -2186,7 +2363,7 @@ class GaussMeterGUI(QMainWindow):
                     self._plot_widget.setYRange(self._chart_y_min, self._chart_y_max, padding=0)
 
             # 频率曲线
-            if self._show_freq_cb.isChecked():
+            if self._show_freq_cb.isChecked() and "freq_hz" in self._buffer.get_channels():
                 ts_f, v_f = self._buffer.get("freq_hz", max_points=max_pts, downsample=ds)
                 if len(ts_f) > 0:
                     ts_f_rel = ts_f - ts_f[-1]
