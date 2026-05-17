@@ -2271,7 +2271,10 @@ class GaussMeterGUI(QMainWindow):
         if latest:
             self._ipc_service.publish_data(
                 timestamp_s=latest.get("timestamp_s", 0.0),
-                field_total_mt=latest.get("field_mt", 0.0),
+                field_x_mt=latest.get("field_x_mt", 0.0),
+                field_y_mt=latest.get("field_y_mt", 0.0),
+                field_z_mt=latest.get("field_z_mt", 0.0),
+                field_total_mt=latest.get("field_mt", 0.0) or latest.get("field_total_mt", 0.0),
                 freq_hz=latest.get("freq_hz", 0.0),
                 temp_c=latest.get("temp_c", 0.0),
             )

@@ -45,6 +45,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "stream_batch_size": 100,
         "stream_batch_interval_s": 0.030,
     },
+    "device_model": "1d_gauss",
     "acquisition": {
         "save_dir": "./experiments",
         "auto_save": False,
