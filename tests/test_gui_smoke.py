@@ -106,6 +106,23 @@ class TestGUISmoke(unittest.TestCase):
                 window.close()
         self.assertIsNotNone(app)
 
+    def test_scan_with_no_verified_ports_keeps_connect_disabled(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            window._ctrl = type("Ctrl", (), {"scan_ports": lambda _self: []})()
+            window._cmd_service = _FakeCommandService()
+            try:
+                window._connect_btn.setEnabled(True)
+                window._on_scan_ports()
+                self.assertFalse(window._connect_btn.isEnabled())
+                self.assertIn("No device found", window._port_combo.currentText())
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
     def test_close_event_stops_acquisition_and_disconnects_controller(self):
         app = QApplication.instance() or QApplication([])
         cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -168,6 +185,43 @@ class TestGUISmoke(unittest.TestCase):
                         window._on_export_review_heatmap_image()
                     self.assertTrue(out.exists())
                     self.assertGreater(out.stat().st_size, 0)
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    def test_multiaxis_zero_offsets_are_component_wise(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        cfg["device_model"] = "3d_gauss"
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            try:
+                window._buffer.append(
+                    {
+                        "field_x_mt": 3.0,
+                        "field_y_mt": 4.0,
+                        "field_z_mt": 12.0,
+                        "field_total_mt": 13.0,
+                    },
+                    timestamp=1.0,
+                )
+                window._on_set_zero()
+                corrected = window._apply_zero_offsets_to_point(
+                    {
+                        "field_x_mt": 5.0,
+                        "field_y_mt": 7.0,
+                        "field_z_mt": 18.0,
+                        "field_total_mt": 20.0,
+                        "field_mt": 20.0,
+                    }
+                )
+                self.assertAlmostEqual(corrected["field_x_mt"], 2.0)
+                self.assertAlmostEqual(corrected["field_y_mt"], 3.0)
+                self.assertAlmostEqual(corrected["field_z_mt"], 6.0)
+                self.assertAlmostEqual(corrected["field_total_mt"], 7.0)
+                self.assertAlmostEqual(corrected["field_mt"], 7.0)
+                self.assertIn("X:", window._zero_offset_label.text())
             finally:
                 window.close()
         self.assertIsNotNone(app)

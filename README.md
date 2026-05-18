@@ -65,6 +65,29 @@ pip install -r requirements-optional.txt
 python main.py
 ```
 
+### Conda Launch Commands
+
+Use the current conda environment for local development:
+
+```bash
+conda activate base
+python -m pip install -r requirements.txt
+python main.py
+```
+
+Optional integrations, including ZMQ/NamedPipe and the OpenGL 3D preview:
+
+```bash
+python -m pip install -r requirements-optional.txt
+python main.py
+```
+
+For automated GUI checks on headless/offscreen environments:
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m unittest discover -v
+```
+
 1. Click **扫描端口 / Scan Ports** to detect the CH-1600
 2. Click **连接 / Connect** to establish the serial connection
 3. Click **开始采集 / Start Acquisition** to begin real-time data streaming

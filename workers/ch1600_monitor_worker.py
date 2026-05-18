@@ -36,7 +36,8 @@ class CH1600MonitorWorker(QObject):
         super().__init__()
         self._driver = driver
         self._queue = command_queue
-        self._interval_ms = max(100, interval_ms)  # 最低 100ms, 确保不超过 10 cmd/s
+        # 每轮会查询 UNIT? 和 RANGE? 两条命令；最低 250ms 保留余量，避免超过 10 cmd/s。
+        self._interval_ms = max(250, interval_ms)
         self._stop_requested = False
         self._query_count = 0
 
@@ -86,7 +87,7 @@ class CH1600MonitorWorker(QObject):
         self._stop_requested = True
 
     def set_interval(self, ms: int) -> None:
-        self._interval_ms = max(100, ms)
+        self._interval_ms = max(250, ms)
 
     def _drain_commands(self) -> None:
         """处理命令队列中的待处理命令。"""

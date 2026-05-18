@@ -175,6 +175,7 @@ class CH1600Recorder:
             else:
                 fmt_parts.append(str(val))
         self._handle.write(",".join(fmt_parts) + "\n")
+        self._handle.flush()
         self._row_count += 1
         self._check_rollover()
 
@@ -203,5 +204,6 @@ class CH1600Recorder:
             lines.append(",".join(fmt_parts))
         if lines:
             self._handle.write("\n".join(lines) + "\n")
+            self._handle.flush()
             self._row_count += len(points)
             self._check_rollover()

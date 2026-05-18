@@ -306,3 +306,42 @@ Todo：
 | 本机验收 | `docs/runtime_validation.md` | Python 环境、optional 依赖、GUI/OpenGL 导出产物 |
 | 当前驱动 | `instruments/ch1600_driver.py` | 命令封装、解析器、面板实时模式 |
 | 当前 GUI | `app/gui.py` | px-1 功能替代实现和 P0 初始化问题 |
+
+## 8. 2026-05-19 增量审查与非真机修复记录
+
+> 本节为增量追加，不删除上文历史判断。范围限定：不需要连接 CH-1600 真机即可确认和修复的问题。本节中的 `[x]` 表示已有代码修复和自动化测试；涉及真实设备、真实 Windows 客户端或长时间硬件采集的项目仍保留为 `[~]` 或 `[ ]`。
+
+### 8.1 本轮已完成修复
+
+- `[x]` 串口扫描不再把未知串口设备列为 `CH-1600? (unverified)`；只有 `UNIT?>` 返回合法单位的端口才进入扫描结果。
+- `[x]` 连接流程不再接受空响应、乱码或非 CH-1600 的 `UNIT?>` 响应；未验证设备身份时关闭串口并报错。
+- `[x]` GUI 初始状态和扫描失败状态下禁用 `连接 / Connect`，避免把 `No device found` 占位文本当作串口号。
+- `[x]` 软件归零改为模型感知：1D 保留 scalar offset；2D/3D 使用 X/Y/Z 分量 offset，并从修正后的分量重新计算 Total B。
+- `[x]` 状态监控 worker 的最小轮询周期改为 250 ms，因为每轮有 `UNIT?` 和 `RANGE?` 两条命令，避免突破 10 cmd/s 限制。
+- `[x]` CSV recorder 每次写点/写 batch 后 flush，降低进程异常退出时最后一批数据丢失风险。
+- `[x]` README 增加 conda 环境启动、optional 依赖安装和离屏测试命令。
+
+### 8.2 本轮新增/扩展的自动化验证
+
+- `[x]` fake serial：未验证 `UNIT?>` 响应会导致 `connect()` 抛错并关闭串口。
+- `[x]` fake serial：`scan_ports()` 会过滤非 CH-1600 响应。
+- `[x]` GUI smoke：无验证端口时 Connect 保持禁用。
+- `[x]` GUI smoke：3D 设备软件归零按分量 offset 修正并重新计算 Total B。
+- `[x]` monitor worker：配置小于协议安全间隔时会被钳制到 250 ms。
+
+### 8.3 本轮完成后的项目 review 结论
+
+- `[x]` P0 级别的“无需真机即可确认”的身份验证、按钮状态、软件归零和命令速率问题已修复。
+- `[~]` FAST 档位、特殊前缀真实缩放、2D 三段长帧含义、探头 profile 真实行为仍不能在无真机条件下升为 `[✓]`。
+- `[~]` SQLite/CSV 已可追溯，但 200/300 Hz 长时间采集仍需性能压测；当前只完成 flush 和主线程批处理改进，后台数据库写入队列仍是后续工程项。
+- `[~]` 空间 heatmap/3D surface 可本机 smoke，但缺真实空间扫描数据、色条单位验收和大网格性能验收。
+- `[~]` ZMQ/NamedPipe 协议有单测，但真实 Windows NamedPipe 客户端、真实 ZMQ 客户端和第三方调用流程仍需集成验收。
+
+### 8.4 增量待办事项
+
+- `[ ]` 数据库写入从 GUI 回调迁移到后台队列，并提供队列积压/写入失败可视化状态。
+- `[ ]` 大文件回看加载迁移到后台 worker，增加进度、取消和错误报告；避免百万行 CSV/TXT 阻塞 GUI。
+- `[ ]` 实时表格迁移到 `QAbstractTableModel`/虚拟表格，替代高频场景下的 `QTableWidget` 行级更新。
+- `[ ]` CSV recorder 增加可配置 fsync 策略：默认 flush，实验室关键记录可开启周期性 fsync。
+- `[ ]` IPC 增加本机 ZMQ client smoke test；Windows 环境补 NamedPipe client smoke test。
+- `[ ]` PyVista/VTK renderer 继续保持 optional spike，只有在大网格性能和交互收益明确后再作为可选后端接入。

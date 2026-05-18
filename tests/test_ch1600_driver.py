@@ -319,6 +319,7 @@ class FakeSerial:
         self.is_open = True
         self.writes = []
         self._buffer = response
+        self.closed = False
 
     @property
     def in_waiting(self) -> int:
@@ -331,6 +332,25 @@ class FakeSerial:
         data = self._buffer[:n]
         self._buffer = self._buffer[n:]
         return data
+
+    def read_until(self, _terminator: bytes = b"\n") -> bytes:
+        return self.read(len(self._buffer))
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+    def reset_output_buffer(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+        self.is_open = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
 
 class TestCommandFraming(unittest.TestCase):
@@ -382,6 +402,23 @@ class TestCommandFraming(unittest.TestCase):
         self.assertAlmostEqual(result["field_x_mt"], 3.0, places=6)
         self.assertAlmostEqual(result["field_y_mt"], 4.0, places=6)
         self.assertAlmostEqual(result["field_z_mt"], 12.0, places=6)
+
+    def test_connect_rejects_unverified_unit_response(self):
+        fake = FakeSerial(response=b"NOT_A_CH1600\n")
+        driver = CH1600Driver()
+        with patch("instruments.ch1600_driver.serial.Serial", return_value=fake), \
+             patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            with self.assertRaises(RuntimeError):
+                driver.connect("COM_FAKE")
+        self.assertTrue(fake.closed)
+
+    def test_scan_ports_omits_unverified_devices(self):
+        class Port:
+            device = "COM_FAKE"
+
+        with patch("serial.tools.list_ports.comports", return_value=[Port()]), \
+             patch("instruments.ch1600_driver.serial.Serial", return_value=FakeSerial(response=b"noise\n")):
+            self.assertEqual(CH1600Driver.scan_ports(), [])
 
 
 if __name__ == "__main__":

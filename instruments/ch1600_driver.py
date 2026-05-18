@@ -191,10 +191,15 @@ class CH1600Driver:
             if unit.startswith("#"):
                 self._panel_streaming_mode = True
                 idn = f"CH-1600@{port} (面板实时发送模式, 指令不可用)"
-            else:
+            elif unit in {"mT", "Gauss", "A/m", "Oe", "oe"}:
                 idn = f"CH-1600@{port} (unit={unit})"
-        except Exception:
-            idn = f"CH-1600@{port} (unverified)"
+            else:
+                raise RuntimeError(f"未识别的 UNIT?> 响应: {unit!r}")
+        except Exception as exc:
+            try:
+                self.close()
+            finally:
+                raise RuntimeError(f"无法验证 CH-1600 设备身份: {exc}") from exc
 
         return idn
 
@@ -231,7 +236,7 @@ class CH1600Driver:
             raise RuntimeError("pyserial is not installed")
         from serial.tools import list_ports as _list_ports
 
-        valid_units = {"mT", "Gauss", "A/m", "oe"}
+        valid_units = {"mT", "Gauss", "A/m", "Oe", "oe"}
         results: List[Tuple[str, str]] = []
         for p in _list_ports.comports():
             port = p.device
@@ -249,13 +254,7 @@ class CH1600Driver:
                     s.write(b"UNIT?>\r")
                     resp = s.read_until(b"\n").decode("ascii", errors="ignore").strip()
                     if resp in valid_units:
-                        label = f"CH-1600 [unit={resp}]"
-                    else:
-                        # 可能是 CH-1600 但响应了其他内容
-                        label = "CH-1600? (unverified)"
-                        if p.serial_number:
-                            label += f" [USB SN:{p.serial_number}]"
-                    results.append((port, label))
+                        results.append((port, f"CH-1600 [unit={resp}]"))
             except Exception:
                 pass
         return results

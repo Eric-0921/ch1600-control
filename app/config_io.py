@@ -52,6 +52,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_save": False,
         "mode_key": "dc_normal",
         "zero_offset": 0.0,
+        "zero_offsets": {},
         "threshold_channel": "field_total",
         "max_file_size_mb": 100,
         "max_file_rows": 100000,

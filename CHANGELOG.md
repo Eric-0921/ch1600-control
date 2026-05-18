@@ -273,3 +273,18 @@ Based on reverse-engineering findings from DataReader2.exe (ILSpy decompilation)
 - `openpyxl` — Excel export (already present in Anaconda environment)
 - `pyzmq` — ZMQ IPC (already present in Anaconda environment)
 - `pywin32` — NamedPipe support (Windows only, already present)
+
+## 2026-05-19 — Reliability Fixes Without Hardware Dependencies
+
+### Fixed
+- Tightened serial discovery so `scan_ports()` only returns ports that answer `UNIT?>` with a recognized CH-1600 unit. Unverified serial devices are no longer shown as `CH-1600?` candidates.
+- Changed connection verification so an invalid or empty `UNIT?>` response raises an error and closes the serial handle instead of enabling the GUI in an unverified state.
+- Disabled the Connect button until a verified scan result exists, and guarded against connecting the placeholder `No device found` row.
+- Reworked software zeroing for 2D/3D devices: offsets are now stored per component (`field_x_mt`, `field_y_mt`, `field_z_mt`) and Total B is recomputed from corrected components. The legacy scalar offset remains for 1D/backward compatibility.
+- Raised the monitor worker minimum interval to 250 ms because each polling cycle sends two serial commands (`UNIT?` and `RANGE?`), keeping the command rate under the 10 cmd/s protocol limit.
+- Flushed CSV recorder writes after each point/batch to reduce data loss if the process exits unexpectedly.
+
+### Tests
+- Added fake-serial coverage for rejecting unverified connection responses and omitting unverified ports from scan results.
+- Added GUI smoke coverage for component-wise zero offsets and disabled Connect state when no verified ports are found.
+- Added monitor worker rate-limit coverage.

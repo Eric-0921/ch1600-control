@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import math
 import time
 import csv
 from pathlib import Path
@@ -231,8 +232,17 @@ class GaussMeterGUI(QMainWindow):
         self._review_table_updating = False
         self._pending_live_table_rows: List[List[str]] = []
 
-        # 软件零点偏移 (仅主线程读写, 无需加锁)
-        self._zero_offset: float = self._cfg.get("acquisition", {}).get("zero_offset", 0.0)
+        # 软件零点偏移 (仅主线程读写, 无需加锁)。保留 legacy scalar，新增分量级 offset。
+        acq_cfg = self._cfg.get("acquisition", {})
+        self._zero_offset: float = float(acq_cfg.get("zero_offset", 0.0) or 0.0)
+        raw_offsets = acq_cfg.get("zero_offsets", {})
+        self._zero_offsets: Dict[str, float] = {}
+        if isinstance(raw_offsets, dict):
+            for key, value in raw_offsets.items():
+                try:
+                    self._zero_offsets[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    pass
 
         # 显示单位换算 (独立于设备单位, GUI 层实时换算)
         self._UNIT_CONVERSION = dict(get_device_capability(self._device_model).display_scales)
@@ -308,6 +318,7 @@ class GaussMeterGUI(QMainWindow):
         else:
             self._display_unit_combo.setCurrentIndex(0)
             self._display_unit = self._display_unit_combo.currentText()
+        self._update_zero_offset_label()
 
         self.log("[GUI] CH-1600 高斯计控制程序已启动")
 
@@ -531,6 +542,7 @@ class GaussMeterGUI(QMainWindow):
         self._connect_btn = QPushButton("连接 / Connect")
         self._connect_btn.setObjectName("primaryBtn")
         self._connect_btn.clicked.connect(self._on_connect)
+        self._connect_btn.setEnabled(False)
         btn_row.addWidget(self._connect_btn)
 
         self._disconnect_btn = QPushButton("断开 / Disconnect")
@@ -2369,9 +2381,11 @@ class GaussMeterGUI(QMainWindow):
         if ports:
             for port, label in ports:
                 self._port_combo.addItem(f"{port} - {label}", port)
+            self._connect_btn.setEnabled(True)
             self.log(f"[GUI] 找到 {len(ports)} 个端口")
         else:
             self._port_combo.addItem("未找到设备 / No device found")
+            self._connect_btn.setEnabled(False)
             self.log("[GUI] 未找到 CH-1600 设备")
 
     def _on_connect(self) -> None:
@@ -2379,6 +2393,9 @@ class GaussMeterGUI(QMainWindow):
             return
         port_text = self._port_combo.currentText()
         port = port_text.split(" - ")[0].strip() if " - " in port_text else port_text.strip()
+        if not port or "未找到设备" in port or "No device found" in port:
+            self.log("[GUI] 未选择已验证的 CH-1600 串口")
+            return
         baud = int(self._baud_combo.currentText())
 
         self.log(f"[GUI] 正在连接 {port} @ {baud}...")
@@ -2499,12 +2516,10 @@ class GaussMeterGUI(QMainWindow):
         if latest != 0.0:
             mode = self._get_active_acq_mode()
             dec = mode["decimals"]
-            field_display = self._convert_field_display(latest - self._zero_offset)
+            field_display = self._convert_field_display(latest)
             self._field_label.setText(f"{field_display:.{dec}f} {unit}")
         # 更新零点偏移标签的单位
-        self._zero_offset_label.setText(
-            f"Zero offset: {self._convert_field_display(self._zero_offset):.4f} {unit}"
-        )
+        self._update_zero_offset_label()
 
     def _on_acq_mode_changed(self) -> None:
         """采集模式变更: 更新图表优化参数 + 模式信息显示。"""
@@ -2687,26 +2702,80 @@ class GaussMeterGUI(QMainWindow):
     # 软件零点偏移校准
     # ------------------------------------------------------------------
 
+    def _offset_for_channel(self, channel: str) -> float:
+        return self._zero_offsets.get(channel, self._zero_offset)
+
+    def _update_zero_offset_label(self) -> None:
+        unit = self._display_unit
+        cap = get_device_capability(self._device_model)
+        if cap.measurement_dimension >= 2 and any(
+            abs(self._zero_offsets.get(ch, 0.0)) > 0.0
+            for ch in ("field_x_mt", "field_y_mt", "field_z_mt")
+        ):
+            parts = []
+            for label, channel in (("X", "field_x_mt"), ("Y", "field_y_mt"), ("Z", "field_z_mt")):
+                if channel in cap.stream_channels:
+                    value = self._convert_field_display(self._zero_offsets.get(channel, 0.0))
+                    parts.append(f"{label}:{value:.4f}")
+            self._zero_offset_label.setText(f"Zero offset: {' '.join(parts)} {unit}")
+            return
+        value = self._convert_field_display(self._offset_for_channel(self._primary_field_channel()))
+        self._zero_offset_label.setText(f"Zero offset: {value:.4f} {unit}")
+
+    def _apply_zero_offsets_to_point(self, point: Dict[str, float]) -> Dict[str, float]:
+        corrected = dict(point)
+        cap = get_device_capability(self._device_model)
+        if cap.measurement_dimension >= 2:
+            components = []
+            for channel in ("field_x_mt", "field_y_mt", "field_z_mt"):
+                if channel in corrected:
+                    corrected[channel] = corrected[channel] - self._zero_offsets.get(channel, 0.0)
+                    components.append(corrected[channel])
+            if components:
+                total = math.sqrt(sum(value * value for value in components))
+                corrected["field_total_mt"] = total
+                corrected["field_mt"] = total
+            return corrected
+
+        offset = self._offset_for_channel("field_total_mt")
+        for channel in ("field_mt", "field_x_mt", "field_total_mt"):
+            if channel in corrected:
+                corrected[channel] = corrected[channel] - offset
+        return corrected
+
     def _on_set_zero(self) -> None:
         """以当前读数为零点，后续数据均减去此偏移。"""
-        # 从 buffer 取的是已修正值，需加回当前 offset 得到原始仪器值
-        field_display = self._buffer.get_latest(self._primary_field_channel())
-        self._zero_offset = field_display + self._zero_offset
-        offset_display = self._convert_field_display(self._zero_offset)
-        self._zero_offset_label.setText(
-            f"Zero offset: {offset_display:.4f} {self._display_unit}"
-        )
-        self._cfg.setdefault("acquisition", {})["zero_offset"] = self._zero_offset
+        cap = get_device_capability(self._device_model)
+        if cap.measurement_dimension >= 2:
+            for channel in ("field_x_mt", "field_y_mt", "field_z_mt"):
+                if channel in cap.stream_channels:
+                    self._zero_offsets[channel] = (
+                        self._buffer.get_latest(channel) + self._zero_offsets.get(channel, 0.0)
+                    )
+            self._zero_offset = 0.0
+        else:
+            channel = self._primary_field_channel()
+            self._zero_offset = self._buffer.get_latest(channel) + self._offset_for_channel(channel)
+            self._zero_offsets = {
+                "field_mt": self._zero_offset,
+                "field_x_mt": self._zero_offset,
+                "field_total_mt": self._zero_offset,
+            }
+        self._update_zero_offset_label()
+        acq_cfg = self._cfg.setdefault("acquisition", {})
+        acq_cfg["zero_offset"] = self._zero_offset
+        acq_cfg["zero_offsets"] = dict(self._zero_offsets)
         save_config(self._cfg)
-        self.log(
-            f"[GUI] 设置软件零点偏移: {offset_display:.4f} {self._display_unit}"
-        )
+        self.log(f"[GUI] 设置软件零点偏移: {self._zero_offset_label.text()}")
 
     def _on_clear_zero(self) -> None:
         """清除零点偏移，恢复原始读数。"""
         self._zero_offset = 0.0
-        self._zero_offset_label.setText(f"Zero offset: 0.0000 {self._display_unit}")
-        self._cfg.setdefault("acquisition", {})["zero_offset"] = 0.0
+        self._zero_offsets.clear()
+        self._update_zero_offset_label()
+        acq_cfg = self._cfg.setdefault("acquisition", {})
+        acq_cfg["zero_offset"] = 0.0
+        acq_cfg["zero_offsets"] = {}
         save_config(self._cfg)
         self.log("[GUI] 已清除软件零点偏移")
 
@@ -3096,27 +3165,27 @@ class GaussMeterGUI(QMainWindow):
 
         if cap.measurement_dimension == 1:
             field_raw = latest.get("field_mt", 0.0)
-            field_display = self._convert_field_display(field_raw - self._zero_offset)
+            field_display = self._convert_field_display(field_raw)
             self._field_label.setText(f"{field_display:.{dec}f} {unit}")
-            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest))
         elif cap.measurement_dimension == 2:
-            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
-            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
-            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            x = self._convert_field_display(latest.get("field_x_mt", 0.0))
+            y = self._convert_field_display(latest.get("field_y_mt", 0.0))
+            t = self._convert_field_display(latest.get("field_total_mt", 0.0))
             self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} B:{t:.{dec}f} {unit}")
-            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest))
         elif cap.measurement_dimension == 3:
-            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
-            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
-            z = self._convert_field_display(latest.get("field_z_mt", 0.0) - self._zero_offset)
-            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            x = self._convert_field_display(latest.get("field_x_mt", 0.0))
+            y = self._convert_field_display(latest.get("field_y_mt", 0.0))
+            z = self._convert_field_display(latest.get("field_z_mt", 0.0))
+            t = self._convert_field_display(latest.get("field_total_mt", 0.0))
             self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} Z:{z:.{dec}f} B:{t:.{dec}f} {unit}")
-            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest))
         else:
             field_raw = latest.get("field_mt", 0.0)
-            field_display = self._convert_field_display(field_raw - self._zero_offset)
+            field_display = self._convert_field_display(field_raw)
             self._field_label.setText(f"{field_display:.{dec}f} {unit}")
-            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest))
 
         if cap.has_freq:
             freq = latest.get("freq_hz", 0.0)
@@ -3192,20 +3261,12 @@ class GaussMeterGUI(QMainWindow):
         if not points:
             return
 
-        # 应用软件零点偏移 (所有 field 分量)
-        if self._zero_offset != 0.0:
-            offset = self._zero_offset
-            new_points = []
-            for p in points:
-                np_ = dict(p)
-                for k in ("field_mt", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"):
-                    if k in np_:
-                        np_[k] = np_[k] - offset
-                new_points.append(np_)
-            points = new_points
+        # 应用软件零点偏移。多轴设备按分量归零并重新计算 Total B。
+        if self._zero_offset != 0.0 or self._zero_offsets:
+            points = [self._apply_zero_offsets_to_point(p) for p in points]
 
         # 用批量中的最新点更新数值显示
-        latest = batch.get("latest", {})
+        latest = points[-1] if points else batch.get("latest", {})
         if latest:
             mode = self._get_active_acq_mode()
             dec = mode["decimals"]
