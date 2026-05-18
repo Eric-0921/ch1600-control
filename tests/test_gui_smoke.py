@@ -20,6 +20,46 @@ from app.gui import GaussMeterGUI, _HAS_PYG, _HAS_PYG_GL
 from data.review_loader import records_to_review_array
 
 
+class _FakeController:
+    def __init__(self, *, connected: bool = False, streaming: bool = False) -> None:
+        self._connected = connected
+        self._streaming = streaming
+        self.disconnect_called = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def is_streaming(self) -> bool:
+        return self._streaming
+
+    def disconnect(self) -> None:
+        self.disconnect_called = True
+        self._connected = False
+        self._streaming = False
+
+
+class _FakeCommandService:
+    def __init__(self, start_result: bool = False) -> None:
+        self.start_result = start_result
+        self.update_config_called = False
+        self.stop_acquisition_called = False
+        self.stop_called = False
+
+    def update_config(self, _cfg) -> None:
+        self.update_config_called = True
+
+    def start_acquisition(self) -> bool:
+        return self.start_result
+
+    def stop_acquisition(self) -> None:
+        self.stop_acquisition_called = True
+
+    def stop(self) -> None:
+        self.stop_called = True
+
+
 class TestGUISmoke(unittest.TestCase):
     def test_gui_instantiates_without_zmq_or_config_mutation(self):
         app = QApplication.instance() or QApplication([])
@@ -43,6 +83,43 @@ class TestGUISmoke(unittest.TestCase):
                 self.assertEqual(window._probe_profile, "weak_field")
             finally:
                 window.close()
+        self.assertIsNotNone(app)
+
+    def test_start_stream_keeps_ui_stopped_when_controller_rejects(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            fake_cmd = _FakeCommandService(start_result=False)
+            window._cmd_service = fake_cmd
+            window._ctrl = _FakeController(connected=False, streaming=False)
+            try:
+                window._stream_start_btn.setEnabled(True)
+                window._stream_stop_btn.setEnabled(False)
+                window._on_start_stream()
+                self.assertTrue(fake_cmd.update_config_called)
+                self.assertTrue(window._stream_start_btn.isEnabled())
+                self.assertFalse(window._stream_stop_btn.isEnabled())
+                self.assertIn("未启动", window._status_label.text())
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    def test_close_event_stops_acquisition_and_disconnects_controller(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            fake_cmd = _FakeCommandService()
+            fake_ctrl = _FakeController(connected=True, streaming=True)
+            window._cmd_service = fake_cmd
+            window._ctrl = fake_ctrl
+            window.close()
+            self.assertTrue(fake_cmd.stop_acquisition_called)
+            self.assertTrue(fake_ctrl.disconnect_called)
+            self.assertTrue(fake_cmd.stop_called)
         self.assertIsNotNone(app)
 
     @unittest.skipUnless(_HAS_PYG, "pyqtgraph is not installed")

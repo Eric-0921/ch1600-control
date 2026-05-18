@@ -693,14 +693,14 @@ class CH1600Driver:
         except ValueError:
             return 0.0
 
-    def query_data_once(self) -> Optional[Dict[str, float]]:
+    def query_data_once(self, model: str = "1d_gauss") -> Optional[Dict[str, float]]:
         """单次查询数据 (DATAS>)。返回完整帧或 None。"""
         raw = self._send_command("DATAS")
         text = raw.decode("ascii", errors="ignore").strip()
         # 格式: "ACK" + 实时数据
         if text.startswith("ACK"):
             text = text[3:]
-        return CH1600Driver.parse_stream_frame(text.encode("ascii"))
+        return CH1600Driver.parse_stream_frame(text.encode("ascii"), model=model)
 
     def query_state(self) -> Dict[str, Any]:
         """查询完整状态快照。"""

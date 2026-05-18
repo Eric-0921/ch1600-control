@@ -373,6 +373,16 @@ class TestCommandFraming(unittest.TestCase):
             driver.set_up_threshold(-1.23)
         self.assertEqual(fake.writes[-1], b"UPTHRES-1.23>\r")
 
+    def test_query_data_once_uses_requested_model(self):
+        driver, fake = self._driver_with_fake_serial(b"ACK#3.0/4.0/12.0>\n")
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            result = driver.query_data_once(model="3d_fluxgate")
+        self.assertEqual(fake.writes[-1], b"DATAS>\r")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["field_x_mt"], 3.0, places=6)
+        self.assertAlmostEqual(result["field_y_mt"], 4.0, places=6)
+        self.assertAlmostEqual(result["field_z_mt"], 12.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

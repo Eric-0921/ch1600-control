@@ -175,7 +175,8 @@ class CommandService(QObject):
         elif ct == CommandType.CH1600_STOP_STREAM:
             raise RuntimeError("STOP_STREAM 必须通过 stop_acquisition() 在主线程调用")
         elif ct == CommandType.CH1600_QUERY_DATA_ONCE:
-            return self._ctrl.driver.query_data_once()
+            device_model = p.get("device_model") or self._cfg.get("device_model", "1d_gauss")
+            return self._ctrl.driver.query_data_once(model=device_model)
 
         # 查询
         elif ct == CommandType.CH1600_QUERY_UNIT:
@@ -251,17 +252,24 @@ class CommandService(QObject):
         cmd = Command(cmd_type=CommandType.CH1600_DISCONNECT)
         self.submit_sync(cmd, timeout=3.0)
 
-    def start_acquisition(self) -> None:
+    def update_config(self, config: Dict[str, Any]) -> None:
+        """更新运行时配置引用，供 GUI 改动后启动采集使用。"""
+        self._cfg = config
+
+    def start_acquisition(self) -> bool:
         """启动数据采集 (流 + 监控)。必须在主线程调用。"""
         # 直接调用 (创建 QThread 必须在主线程)
         mode_key = self._cfg.get("acquisition", {}).get("mode_key", "dc_normal")
         device_model = self._cfg.get("device_model", "1d_gauss")
-        self._ctrl.start_streaming(
+        started = self._ctrl.start_streaming(
             batch_size=self._cfg.get("ch1600", {}).get("stream_batch_size", 100),
             mode_key=mode_key,
             device_model=device_model,
         )
-        self._ctrl.start_monitoring(interval_ms=500)
+        if started:
+            interval_ms = self._cfg.get("monitor", {}).get("interval_ms", 500)
+            self._ctrl.start_monitoring(interval_ms=interval_ms)
+        return started
 
     def stop_acquisition(self) -> None:
         """停止数据采集。必须在主线程调用。"""

@@ -22,7 +22,7 @@ from PyQt5.QtGui import QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMenuBar, QMessageBox, QPushButton, QSizePolicy, QSplitter,
+    QMenuBar, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
@@ -64,8 +64,11 @@ SIEMENS_STYLE = """
 QMainWindow, QWidget {
     background-color: #f0f0f0;
     color: #1a1a1a;
-    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-family: Arial;
     font-size: 12px;
+}
+QScrollArea {
+    background-color: #f0f0f0; border: none;
 }
 QMenuBar {
     background-color: #e8e8e8; border-bottom: 1px solid #c0c0c0;
@@ -98,13 +101,13 @@ QLabel#sectionTitle {
     padding: 4px 0; border-bottom: 2px solid #0080c8;
 }
 QLabel#bigData {
-    font-family: Consolas, "Courier New", monospace;
+    font-family: Menlo, Monaco, "Courier New";
     font-size: 22px; font-weight: 700; color: #005c8a;
     padding: 10px; border: 1px solid #c0c0c0; border-radius: 3px;
     background-color: #f8f8f8;
 }
 QLabel#smallData {
-    font-family: Consolas, "Courier New", monospace;
+    font-family: Menlo, Monaco, "Courier New";
     font-size: 16px; font-weight: 700; color: #005c8a;
     padding: 8px; border: 1px solid #c0c0c0; border-radius: 3px;
     background-color: #f8f8f8;
@@ -149,7 +152,7 @@ QCheckBox::indicator {
 }
 QCheckBox::indicator:checked { background-color: #0080c8; border-color: #006ba0; }
 QTextEdit {
-    font-family: Consolas, "Courier New", monospace; font-size: 11px;
+    font-family: Menlo, Monaco, "Courier New"; font-size: 11px;
     background-color: #ffffff; border: 1px solid #c0c0c0; color: #1a1a1a;
 }
 QStatusBar {
@@ -181,6 +184,7 @@ QLabel#globalLed[on="warn"] { background-color: #e04040; border-color: #c03030; 
 class GaussMeterGUI(QMainWindow):
     _ipc_start_requested = pyqtSignal()
     _ipc_stop_requested = pyqtSignal()
+    _raw_log_received = pyqtSignal(str, bytes)
 
     def __init__(self, cmd_service: CommandService | None = None) -> None:
         super().__init__()
@@ -242,6 +246,7 @@ class GaussMeterGUI(QMainWindow):
         )
         self._ipc_start_requested.connect(self._on_start_stream)
         self._ipc_stop_requested.connect(self._on_stop_stream)
+        self._raw_log_received.connect(self._append_raw_log)
         # 注册命令回调
         self._ipc_service.set_command_callbacks({
             "start_acquisition": self._queue_ipc_start,
@@ -369,6 +374,20 @@ class GaussMeterGUI(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_label = QLabel("就绪 / Ready")
         self._status_bar.addPermanentWidget(self._status_label)
+
+    def _create_scrolled_page(self) -> Tuple[QScrollArea, QWidget, QVBoxLayout]:
+        """创建可滚动页面，避免长控制面板在小窗口内互相挤压。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        return scroll, content, layout
 
     # ------------------------------------------------------------------
     # 全局状态栏
@@ -539,9 +558,7 @@ class GaussMeterGUI(QMainWindow):
     # ==================================================================
 
     def _build_param_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 16)
+        page, _content, layout = self._create_scrolled_page()
 
         title = QLabel("参数设置 / Parameters")
         title.setObjectName("sectionTitle")
@@ -761,9 +778,7 @@ class GaussMeterGUI(QMainWindow):
     # ==================================================================
 
     def _build_live_data_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 16)
+        page, _content, layout = self._create_scrolled_page()
 
         title = QLabel("实时数据 / Live Data")
         title.setObjectName("sectionTitle")
@@ -876,15 +891,17 @@ class GaussMeterGUI(QMainWindow):
 
         self._zero_offset_label = QLabel("Zero offset: 0.0000 mT")
         self._zero_offset_label.setObjectName("smallData")
-        ctrl_row.addWidget(self._zero_offset_label)
 
         ctrl_row.addStretch()
-
-        # 统计
         self._live_stats = QLabel("FPS: -- | 数据点: 0 | 状态: 就绪")
-        ctrl_row.addWidget(self._live_stats)
 
         layout.addLayout(ctrl_row)
+
+        ctrl_status_row = QHBoxLayout()
+        ctrl_status_row.addWidget(self._zero_offset_label)
+        ctrl_status_row.addStretch()
+        ctrl_status_row.addWidget(self._live_stats)
+        layout.addLayout(ctrl_status_row)
 
         # pyqtgraph 图表
         if _HAS_PYG:
@@ -893,7 +910,7 @@ class GaussMeterGUI(QMainWindow):
             self._plot_widget.setLabel("bottom", "时间", units="s")
             self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
             self._plot_widget.addLegend()
-            self._plot_widget.setMinimumHeight(200)
+            self._plot_widget.setMinimumHeight(260)
 
             # 性能优化
             self._plot_widget.setClipToView(True)
@@ -930,7 +947,7 @@ class GaussMeterGUI(QMainWindow):
             )
             self._plot_widget.addItem(self._zero_line)
 
-            layout.addWidget(self._plot_widget, 1)
+            layout.addWidget(self._plot_widget)
         else:
             self._plot_widget = None
             no_plot = QLabel("pyqtgraph 未安装, 图表不可用 / pyqtgraph not installed")
@@ -1232,11 +1249,9 @@ class GaussMeterGUI(QMainWindow):
 
         self._review_apply_filter_btn = QPushButton("应用选区 / Apply")
         self._review_apply_filter_btn.clicked.connect(self._apply_review_filter)
-        filter_layout.addWidget(self._review_apply_filter_btn, 0, 8)
 
         self._review_reset_filter_btn = QPushButton("重置 / Reset")
         self._review_reset_filter_btn.clicked.connect(self._reset_review_filter_controls)
-        filter_layout.addWidget(self._review_reset_filter_btn, 0, 9)
 
         self._review_auto_axis_cb = QCheckBox("自动坐标 / Auto Axes")
         self._review_auto_axis_cb.setChecked(
@@ -1265,15 +1280,25 @@ class GaussMeterGUI(QMainWindow):
 
         save_view_btn = QPushButton("保存视图 / Save View")
         save_view_btn.clicked.connect(self._save_review_view_preset)
-        filter_layout.addWidget(save_view_btn, 1, 8)
 
         export_sel_btn = QPushButton("导出选区 CSV / Export Selection")
         export_sel_btn.clicked.connect(self._on_export_review_selection)
-        filter_layout.addWidget(export_sel_btn, 1, 9)
 
         report_btn = QPushButton("HTML 报告 / HTML Report")
         report_btn.clicked.connect(self._on_export_review_report)
-        filter_layout.addWidget(report_btn, 1, 10)
+
+        filter_actions = QHBoxLayout()
+        for btn in (
+            self._review_apply_filter_btn,
+            self._review_reset_filter_btn,
+            save_view_btn,
+            export_sel_btn,
+            report_btn,
+        ):
+            btn.setMinimumWidth(120)
+            filter_actions.addWidget(btn)
+        filter_actions.addStretch()
+        filter_layout.addLayout(filter_actions, 2, 0, 1, 8)
 
         layout.addWidget(filter_grp)
 
@@ -2227,7 +2252,7 @@ class GaussMeterGUI(QMainWindow):
         rx_v = QVBoxLayout(rx_grp)
         self._debug_rx_text = QTextEdit()
         self._debug_rx_text.setReadOnly(True)
-        self._debug_rx_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        self._debug_rx_text.setStyleSheet("font-family: Menlo, Monaco, 'Courier New'; font-size: 11px;")
         rx_v.addWidget(self._debug_rx_text)
         rx_ctrl = QHBoxLayout()
         self._debug_rx_hex_cb = QCheckBox("Hex 显示")
@@ -2280,6 +2305,10 @@ class GaussMeterGUI(QMainWindow):
             self.log(f"[DEBUG] 发送失败: {exc}")
 
     def _on_raw_log(self, direction: str, data: bytes) -> None:
+        """Driver raw-log callback; may be invoked outside the GUI thread."""
+        self._raw_log_received.emit(direction, data)
+
+    def _append_raw_log(self, direction: str, data: bytes) -> None:
         if direction == "TX":
             text = data.decode("ascii", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
             self._debug_rx_text.append(f'<span style="color:#00a651;">[TX] {text}</span>')
@@ -2832,7 +2861,14 @@ class GaussMeterGUI(QMainWindow):
     def _on_start_stream(self) -> None:
         if self._cmd_service is None:
             return
-        self._cmd_service.start_acquisition()
+        self._cmd_service.update_config(self._cfg)
+        started = self._cmd_service.start_acquisition()
+        if not started:
+            self._stream_start_btn.setEnabled(True)
+            self._stream_stop_btn.setEnabled(False)
+            self._update_global_bar(self._ctrl.is_connected if self._ctrl else False, False)
+            self.log("[GUI] 数据采集未启动")
+            return
         self._stream_start_btn.setEnabled(False)
         self._stream_stop_btn.setEnabled(True)
         self._buffer.clear()
@@ -3371,6 +3407,14 @@ class GaussMeterGUI(QMainWindow):
     # ==================================================================
 
     def closeEvent(self, event) -> None:
+        if self._ctrl:
+            try:
+                if self._ctrl.is_streaming and self._cmd_service:
+                    self._cmd_service.stop_acquisition()
+                if self._ctrl.is_connected:
+                    self._ctrl.disconnect()
+            except Exception as exc:
+                self.log(f"[GUI] 关闭设备失败: {exc}")
         if self._cmd_service:
             self._cmd_service.stop()
         if self._recorder and self._recorder.is_recording:
