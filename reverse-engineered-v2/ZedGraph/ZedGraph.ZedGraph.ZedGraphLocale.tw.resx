@@ -1,0 +1,44 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+<resheader name="resmimetype"><value>text/microsoft-resx</value></resheader><resheader name="version"><value>1.3</value></resheader><resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader><resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader><data name="save_as" xml:space="preserve"><value>另存圖表...</value></data>
+  <data name="unscroll" xml:space="preserve"><value>復原捲動</value></data>
+  <data name="undo_all" xml:space="preserve"><value>復原縮放/移動</value></data>
+  <data name="y_title_def" xml:space="preserve"><value>Y軸</value></data>
+  <data name="copied_to_clip" xml:space="preserve"><value>複製圖表至剪貼簿</value></data>
+  <data name="unpan" xml:space="preserve"><value>復原移動</value></data>
+  <data name="print" xml:space="preserve"><value>列印...</value></data>
+  <data name="page_setup" xml:space="preserve"><value>頁面設定...</value></data>
+  <data name="show_val" xml:space="preserve"><value>顯示節點數值</value></data>
+  <data name="title_def" xml:space="preserve"><value>標題</value></data>
+  <data name="x_title_def" xml:space="preserve"><value>X軸</value></data>
+  <data name="unzoom" xml:space="preserve"><value>復原縮放</value></data>
+  <data name="set_default" xml:space="preserve"><value>恢復成原來大小</value></data>
+  <data name="copy" xml:space="preserve"><value>複製</value></data>
+  </root>

@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+  <PropertyGroup>
+    <AssemblyName>DMSkin</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <UseWindowsForms>True</UseWindowsForms>
+    <TargetFramework>net20</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>14.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <RootNamespace />
+  </PropertyGroup>
+  <ItemGroup>
+    <None Remove="83aij0xVE5PQNnxbjW.oA8V9o3dsMSXSeVUEw" />
+    <None Remove="gsQq7hNCiAyEWRZ2kK.EgQgeWWVCOy1kkoupf" />
+    <None Remove="7UBIRrIRLQUsvZQRpU.6ERL9R2n9QP92mOxwl" />
+    <None Remove="Ubuw45bGlV4EMuwWhK.nvKW0pwpoe7QK2REhd" />
+    <EmbeddedResource Include="83aij0xVE5PQNnxbjW.oA8V9o3dsMSXSeVUEw" LogicalName="83aij0xVE5PQNnxbjW.oA8V9o3dsMSXSeVUEw" />
+    <EmbeddedResource Include="gsQq7hNCiAyEWRZ2kK.EgQgeWWVCOy1kkoupf" LogicalName="gsQq7hNCiAyEWRZ2kK.EgQgeWWVCOy1kkoupf" />
+    <EmbeddedResource Include="7UBIRrIRLQUsvZQRpU.6ERL9R2n9QP92mOxwl" LogicalName="7UBIRrIRLQUsvZQRpU.6ERL9R2n9QP92mOxwl" />
+    <EmbeddedResource Include="Ubuw45bGlV4EMuwWhK.nvKW0pwpoe7QK2REhd" LogicalName="Ubuw45bGlV4EMuwWhK.nvKW0pwpoe7QK2REhd" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Design" />
+  </ItemGroup>
+</Project>

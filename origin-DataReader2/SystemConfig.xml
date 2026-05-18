@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="GBK"?>
+<SystemConfig>
+  <key name="TYPE" value="三维高斯计" />
+  <key name="ICON_VISABLE" value="true" />
+  <key name="ShowNormal" value="false" />
+  <key name="AlwaysReading" value="false" />
+  <key name="ClearRam" value="false" />
+  <key name="ShowLastRow" value="false" />
+  <key name="RefreshTime" value="0.1" />
+  <key name="SendOut" value="false" />
+  <key name="SendOutWith" value="false" />
+  <key name="JudgeOpen" value="false" />
+  <key name="Judge" value="false" />
+  <key name="JudgeUp" value="20000" />
+  <key name="JudgeDown" value="-4000" />
+  <key name="SaveToFile" value="true" />
+  <key name="STFDataMaximum" value="542.4810" />
+  <key name="STFReachMaximum" value="ATNF" />
+  <key name="GraphScale" value="300" />
+  <key name="CH1Color" value="#FFC0C0" />
+  <key name="CH2Color" value="#C0FFC0" />
+  <key name="CH2Color" value="#C0C0FF" />
+  <key name="CH3Color" value="#C0C0FF" />
+  <key name="CH4Color" value="#FFC080" />
+  <key name="CurveWidth" value="1" />
+  <key name="GuassUnit" value="0" />
+  <key name="PIPE" value="false" />
+  <key name="PipeName" value="SerialDataReader" />
+  <key name="SaveDataByTime" value="false" />
+  <key name="SaveDataTime" value="2" />
+  <key name="QG" value="false" />
+  <key name="b_lampEnable" value="False" />
+  <key name="COMMSET_LAMP" value="COM1" />
+  <key name="BADURATE_LAMP" value="9600" />
+  <key name="Judge_ABS" value="false" />
+  <key name="CAE" value="true" />
+</SystemConfig>

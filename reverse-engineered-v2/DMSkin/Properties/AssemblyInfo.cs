@@ -1,0 +1,20 @@
+using System.Diagnostics;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Permissions;
+
+[assembly: ComVisible(false)]
+[assembly: AssemblyTrademark("DMSkin-QQ944095635")]
+[assembly: AssemblyCopyright("唯一官方:www.dmskin.com")]
+[assembly: Guid("79745b91-a41f-4a3f-b927-67dd6ff8fded")]
+[assembly: AssemblyKeyName("")]
+[assembly: AssemblyDelaySign(false)]
+[assembly: AssemblyFileVersion("0.3.1.6")]
+[assembly: AssemblyTitle("DMSkin")]
+[assembly: AssemblyCompany("小江QQ944095635")]
+[assembly: AssemblyProduct("DMSkin皮肤插件")]
+[assembly: AssemblyDescription("版本号:B316")]
+[assembly: AssemblyConfiguration("")]
+[assembly: AssemblyVersion("0.3.1.6")]
