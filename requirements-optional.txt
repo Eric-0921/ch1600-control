@@ -1,0 +1,6 @@
+# Optional integrations
+pyzmq>=25.0
+pywin32>=306; platform_system == "Windows"
+
+# Optional 3D surface preview in the review page
+PyOpenGL>=3.1

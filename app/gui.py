@@ -11,30 +11,42 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import time
 import csv
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
+    QApplication, QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenuBar, QMessageBox, QPushButton, QSizePolicy, QSplitter,
-    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTableWidget, QTableWidgetItem,
+    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 import numpy as np
 from data.circular_buffer import CircularBuffer
+from data.device_capabilities import (
+    get_device_capability, get_probe_profile, iter_device_capabilities,
+    iter_probe_profiles, normalize_sample_by_capability,
+)
 from data.recorder import CH1600Recorder
-from data.review_loader import load_review_files, get_review_summary
+from data.reporting import evaluate_threshold, export_html_report
+from data.review_loader import (
+    export_review_selection_csv, filter_review_data, get_review_summary,
+    load_review_files, merge_review_arrays, primary_field_name,
+)
+from data.spatial import build_heatmap_grid, build_interpolated_heatmap_grid, build_surface_grid
+from data.sqlite_store import CH1600SQLiteStore
 from core.command_service import CommandService
 from core.commands import Command, CommandType
 from core.external_ipc import ExternalIPCService
 from app.config_io import ACQ_MODE_TABLE, load_config, save_config
+from app.surface_renderer import SurfaceRenderer
 
 try:
     import pyqtgraph as pg
@@ -42,6 +54,7 @@ try:
 except ImportError:
     _HAS_PYG = False
 
+_HAS_PYG_GL = SurfaceRenderer.is_available()
 
 # ------------------------------------------------------------------
 # Siemens 工业风样式表 (复用 odmr-control)
@@ -166,6 +179,8 @@ QLabel#globalLed[on="warn"] { background-color: #e04040; border-color: #c03030; 
 # ------------------------------------------------------------------
 
 class GaussMeterGUI(QMainWindow):
+    _ipc_start_requested = pyqtSignal()
+    _ipc_stop_requested = pyqtSignal()
 
     def __init__(self, cmd_service: CommandService | None = None) -> None:
         super().__init__()
@@ -174,6 +189,8 @@ class GaussMeterGUI(QMainWindow):
 
         # 配置
         self._cfg = load_config()
+        self._device_model = self._cfg.get("device_model", "1d_gauss")
+        self._probe_profile = self._cfg.get("probe_profile", "standard_hall")
 
         # 核心
         self._cmd_service = cmd_service
@@ -192,16 +209,7 @@ class GaussMeterGUI(QMainWindow):
 
         # 数据缓冲 (通道根据设备型号动态决定)
         buffer_cap = self._cfg.get("ui", {}).get("chart_history_points", 5000)
-        if self._device_model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
-            init_channels = ["field_mt", "freq_hz", "temp_c"]
-        elif self._device_model == "2d_gauss":
-            init_channels = ["field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"]
-        elif self._device_model == "3d_gauss":
-            init_channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"]
-        elif self._device_model == "3d_fluxgate":
-            init_channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"]
-        else:
-            init_channels = ["field_mt", "freq_hz", "temp_c"]
+        init_channels = list(get_device_capability(self._device_model).stream_channels)
         self._buffer = CircularBuffer(
             channels=init_channels,
             capacity=buffer_cap,
@@ -209,25 +217,21 @@ class GaussMeterGUI(QMainWindow):
 
         # 记录
         self._recorder: Optional[CH1600Recorder] = None
+        self._db_store: Optional[CH1600SQLiteStore] = None
+        self._db_session_id: Optional[int] = None
+
+        # 数据回看
+        self._review_data: Optional[np.ndarray] = None
+        self._review_filtered_data: Optional[np.ndarray] = None
+        self._review_file_paths: List[Path] = []
+        self._review_table_updating = False
+        self._pending_live_table_rows: List[List[str]] = []
 
         # 软件零点偏移 (仅主线程读写, 无需加锁)
         self._zero_offset: float = self._cfg.get("acquisition", {}).get("zero_offset", 0.0)
 
-        # 设备模型 (影响表格列数与可用单位)
-        self._device_model = self._cfg.get("device_model", "1d_gauss")
-
         # 显示单位换算 (独立于设备单位, GUI 层实时换算)
-        self._UNIT_CONVERSION_BY_MODEL = {
-            "1d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
-            "2d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
-            "3d_gauss": {"mT": 1.0, "G": 10.0, "Oe": 10.0, "A/m": 79.577, "mGs": 10000.0},
-            "fluxmeter": {"mWb": 1.0},
-            "1d_fluxgate": {"nT": 1.0},
-            "3d_fluxgate": {"nT": 1.0},
-        }
-        self._UNIT_CONVERSION = self._UNIT_CONVERSION_BY_MODEL.get(
-            self._device_model, self._UNIT_CONVERSION_BY_MODEL["1d_gauss"]
-        )
+        self._UNIT_CONVERSION = dict(get_device_capability(self._device_model).display_scales)
         self._display_unit: str = self._cfg.get("ui", {}).get("display_unit", self._default_unit_for_model())
 
         # 外部 IPC
@@ -236,10 +240,12 @@ class GaussMeterGUI(QMainWindow):
             data_pub_port=ipc_cfg.get("zmq_data_port", 5555),
             cmd_rep_port=ipc_cfg.get("zmq_cmd_port", 5556),
         )
+        self._ipc_start_requested.connect(self._on_start_stream)
+        self._ipc_stop_requested.connect(self._on_stop_stream)
         # 注册命令回调
         self._ipc_service.set_command_callbacks({
-            "start_acquisition": lambda: self._cmd_service and self._cmd_service.start_acquisition(),
-            "stop_acquisition": lambda: self._cmd_service and self._cmd_service.stop_acquisition(),
+            "start_acquisition": self._queue_ipc_start,
+            "stop_acquisition": self._queue_ipc_stop,
             "get_status": self._get_ipc_status,
         })
 
@@ -262,12 +268,17 @@ class GaussMeterGUI(QMainWindow):
 
         # 构建 UI
         self._setup_ui()
+        self._init_database_store()
 
         # 显示更新定时器
         display_ms = self._cfg.get("ui", {}).get("display_interval_ms", 30)
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._on_display_tick)
         self._display_timer.start(max(16, display_ms))  # 最低 ~60 FPS cap
+
+        self._live_table_timer = QTimer(self)
+        self._live_table_timer.timeout.connect(self._flush_live_table_rows)
+        self._live_table_timer.start(150)
 
         # 记录统计定时器
         self._rec_stats_timer = QTimer(self)
@@ -292,10 +303,6 @@ class GaussMeterGUI(QMainWindow):
         else:
             self._display_unit_combo.setCurrentIndex(0)
             self._display_unit = self._display_unit_combo.currentText()
-
-        # 数据回看
-        self._review_data: Optional[np.ndarray] = None
-        self._review_file_paths: List[Path] = []
 
         self.log("[GUI] CH-1600 高斯计控制程序已启动")
 
@@ -444,6 +451,27 @@ class GaussMeterGUI(QMainWindow):
             "streaming": self._ctrl.is_streaming if self._ctrl else False,
         }
 
+    def _queue_ipc_start(self) -> dict:
+        self._ipc_start_requested.emit()
+        return {"queued": True}
+
+    def _queue_ipc_stop(self) -> dict:
+        self._ipc_stop_requested.emit()
+        return {"queued": True}
+
+    def _init_database_store(self) -> None:
+        db_cfg = self._cfg.get("database", {})
+        if not db_cfg.get("enabled", True):
+            self.log("[DB] SQLite 记录已禁用")
+            return
+        try:
+            db_path = Path(db_cfg.get("path", "./experiments/m1600.sqlite3"))
+            self._db_store = CH1600SQLiteStore(db_path)
+            self.log(f"[DB] SQLite 数据库就绪: {db_path}")
+        except Exception as exc:
+            self._db_store = None
+            self.log(f"[DB] SQLite 初始化失败: {exc}")
+
     # ==================================================================
     # 页面 0: 连接
     # ==================================================================
@@ -546,23 +574,29 @@ class GaussMeterGUI(QMainWindow):
 
         ag.addWidget(QLabel("设备型号 / Device Model:"), 2, 0)
         self._device_model_combo = QComboBox()
-        self._device_model_combo.addItem("一维高斯计 / 1D Gauss", "1d_gauss")
-        self._device_model_combo.addItem("二维高斯计 / 2D Gauss", "2d_gauss")
-        self._device_model_combo.addItem("三维高斯计 / 3D Gauss", "3d_gauss")
-        self._device_model_combo.addItem("磁通计 / Fluxmeter", "fluxmeter")
-        self._device_model_combo.addItem("一维磁通门计 / 1D Fluxgate", "1d_fluxgate")
-        self._device_model_combo.addItem("三维磁通门计 / 3D Fluxgate", "3d_fluxgate")
+        for cap in iter_device_capabilities():
+            self._device_model_combo.addItem(cap.label, cap.model)
         idx = self._device_model_combo.findData(self._device_model)
         if idx >= 0:
             self._device_model_combo.setCurrentIndex(idx)
         self._device_model_combo.currentIndexChanged.connect(self._on_device_model_changed)
         ag.addWidget(self._device_model_combo, 2, 1)
 
+        ag.addWidget(QLabel("探头档案 / Probe Profile:"), 3, 0)
+        self._probe_profile_combo = QComboBox()
+        for profile in iter_probe_profiles():
+            self._probe_profile_combo.addItem(profile.label, profile.name)
+        pidx = self._probe_profile_combo.findData(self._probe_profile)
+        if pidx >= 0:
+            self._probe_profile_combo.setCurrentIndex(pidx)
+        self._probe_profile_combo.currentIndexChanged.connect(self._on_probe_profile_changed)
+        ag.addWidget(self._probe_profile_combo, 3, 1)
+
         # 模式信息
         self._acq_info_label = QLabel()
         self._acq_info_label.setObjectName("smallData")
         self._acq_info_label.setWordWrap(True)
-        ag.addWidget(self._acq_info_label, 3, 0, 1, 2)
+        ag.addWidget(self._acq_info_label, 4, 0, 1, 2)
 
         layout.addWidget(acq_grp)
 
@@ -688,6 +722,10 @@ class GaussMeterGUI(QMainWindow):
         self._ipc_enabled_cb.setChecked(
             ipc_cfg.get("enabled", False) and ipc_cfg.get("mode", "zmq") == "zmq"
         )
+        if not self._ipc_service.zmq_available:
+            self._ipc_enabled_cb.setChecked(False)
+            self._ipc_enabled_cb.setEnabled(False)
+            self._ipc_enabled_cb.setToolTip("pyzmq 未安装，ZMQ IPC 不可用")
         ipc_mode_row.addWidget(self._ipc_enabled_cb)
 
         self._ipc_namedpipe_cb = QCheckBox("启用 NamedPipe / Enable NamedPipe")
@@ -791,6 +829,14 @@ class GaussMeterGUI(QMainWindow):
         self._judge_abs_cb = QCheckBox("ABS 绝对值 / Absolute")
         self._judge_abs_cb.setToolTip("先取绝对值再判断")
         jv.addWidget(self._judge_abs_cb)
+
+        self._judge_channel_combo = QComboBox()
+        saved_judge_channel = self._cfg.get("acquisition", {}).get("threshold_channel", "field_total")
+        self._populate_threshold_channel_combo(saved_judge_channel)
+        self._judge_channel_combo.currentTextChanged.connect(self._on_threshold_channel_changed)
+        self._judge_channel_combo.setToolTip("阈值判断通道，默认使用 Total B")
+        jv.addWidget(QLabel("通道 / Channel:"))
+        jv.addWidget(self._judge_channel_combo)
 
         jv.addStretch()
         layout.addWidget(judge_grp)
@@ -1135,6 +1181,102 @@ class GaussMeterGUI(QMainWindow):
 
         layout.addWidget(file_grp)
 
+        # 数据库查询区
+        db_grp = QGroupBox("数据库查询 / SQLite Query")
+        db_layout = QHBoxLayout(db_grp)
+        db_layout.addWidget(QLabel("Session ID:"))
+        self._review_db_session_spin = QSpinBox()
+        self._review_db_session_spin.setRange(0, 2_000_000_000)
+        self._review_db_session_spin.setToolTip("0 表示查询全部 session")
+        db_layout.addWidget(self._review_db_session_spin)
+
+        db_layout.addWidget(QLabel("Source:"))
+        self._review_db_source_combo = QComboBox()
+        self._review_db_source_combo.addItems(["all", "realtime", "import_csv", "import_txt", "device_memory"])
+        self._review_db_source_combo.setCurrentText(
+            self._cfg.get("review", {}).get("default_source", "all")
+        )
+        db_layout.addWidget(self._review_db_source_combo)
+
+        self._review_load_db_btn = QPushButton("载入数据库 / Load DB")
+        self._review_load_db_btn.clicked.connect(self._on_load_review_from_database)
+        db_layout.addWidget(self._review_load_db_btn)
+        db_layout.addStretch()
+        layout.addWidget(db_grp)
+
+        # 选区与坐标控制
+        filter_grp = QGroupBox("节选与坐标 / Selection & Axes")
+        filter_layout = QGridLayout(filter_grp)
+
+        self._review_seq_start_spin = QSpinBox()
+        self._review_seq_start_spin.setRange(0, 2_000_000_000)
+        self._review_seq_start_spin.setToolTip("0 表示不限制起始序号")
+        self._review_seq_end_spin = QSpinBox()
+        self._review_seq_end_spin.setRange(0, 2_000_000_000)
+        self._review_seq_end_spin.setToolTip("0 表示不限制截止序号")
+        self._review_time_start_edit = QLineEdit()
+        self._review_time_start_edit.setPlaceholderText("相对秒，可空")
+        self._review_time_start_edit.setFixedWidth(90)
+        self._review_time_end_edit = QLineEdit()
+        self._review_time_end_edit.setPlaceholderText("相对秒，可空")
+        self._review_time_end_edit.setFixedWidth(90)
+
+        filter_layout.addWidget(QLabel("序号 / Seq:"), 0, 0)
+        filter_layout.addWidget(self._review_seq_start_spin, 0, 1)
+        filter_layout.addWidget(QLabel("到 / To"), 0, 2)
+        filter_layout.addWidget(self._review_seq_end_spin, 0, 3)
+        filter_layout.addWidget(QLabel("时间 / Time:"), 0, 4)
+        filter_layout.addWidget(self._review_time_start_edit, 0, 5)
+        filter_layout.addWidget(QLabel("到 / To"), 0, 6)
+        filter_layout.addWidget(self._review_time_end_edit, 0, 7)
+
+        self._review_apply_filter_btn = QPushButton("应用选区 / Apply")
+        self._review_apply_filter_btn.clicked.connect(self._apply_review_filter)
+        filter_layout.addWidget(self._review_apply_filter_btn, 0, 8)
+
+        self._review_reset_filter_btn = QPushButton("重置 / Reset")
+        self._review_reset_filter_btn.clicked.connect(self._reset_review_filter_controls)
+        filter_layout.addWidget(self._review_reset_filter_btn, 0, 9)
+
+        self._review_auto_axis_cb = QCheckBox("自动坐标 / Auto Axes")
+        self._review_auto_axis_cb.setChecked(
+            not self._cfg.get("review", {}).get("manual_axis_enabled", False)
+        )
+        self._review_auto_axis_cb.toggled.connect(self._update_review_plot)
+        filter_layout.addWidget(self._review_auto_axis_cb, 1, 0, 1, 2)
+
+        self._review_x_min_edit = QLineEdit(str(self._cfg.get("review", {}).get("x_min_s", 0.0)))
+        self._review_x_min_edit.setFixedWidth(80)
+        self._review_x_max_edit = QLineEdit(str(self._cfg.get("review", {}).get("x_max_s", 60.0)))
+        self._review_x_max_edit.setFixedWidth(80)
+        self._review_y_min_edit = QLineEdit(str(self._cfg.get("review", {}).get("y_min", -1.0)))
+        self._review_y_min_edit.setFixedWidth(80)
+        self._review_y_max_edit = QLineEdit(str(self._cfg.get("review", {}).get("y_max", 1.0)))
+        self._review_y_max_edit.setFixedWidth(80)
+        for edit in (self._review_x_min_edit, self._review_x_max_edit, self._review_y_min_edit, self._review_y_max_edit):
+            edit.editingFinished.connect(self._update_review_plot)
+
+        filter_layout.addWidget(QLabel("X min/max:"), 1, 2)
+        filter_layout.addWidget(self._review_x_min_edit, 1, 3)
+        filter_layout.addWidget(self._review_x_max_edit, 1, 4)
+        filter_layout.addWidget(QLabel("Y min/max:"), 1, 5)
+        filter_layout.addWidget(self._review_y_min_edit, 1, 6)
+        filter_layout.addWidget(self._review_y_max_edit, 1, 7)
+
+        save_view_btn = QPushButton("保存视图 / Save View")
+        save_view_btn.clicked.connect(self._save_review_view_preset)
+        filter_layout.addWidget(save_view_btn, 1, 8)
+
+        export_sel_btn = QPushButton("导出选区 CSV / Export Selection")
+        export_sel_btn.clicked.connect(self._on_export_review_selection)
+        filter_layout.addWidget(export_sel_btn, 1, 9)
+
+        report_btn = QPushButton("HTML 报告 / HTML Report")
+        report_btn.clicked.connect(self._on_export_review_report)
+        filter_layout.addWidget(report_btn, 1, 10)
+
+        layout.addWidget(filter_grp)
+
         # 统计信息区
         stats_grp = QGroupBox("统计信息 / Statistics")
         stats_layout = QGridLayout(stats_grp)
@@ -1169,6 +1311,11 @@ class GaussMeterGUI(QMainWindow):
 
         # 图表区
         if _HAS_PYG:
+            self._review_plot_tabs = QTabWidget()
+            time_plot_page = QWidget()
+            time_plot_layout = QVBoxLayout(time_plot_page)
+            time_plot_layout.setContentsMargins(0, 0, 0, 0)
+
             self._review_plot_widget = pg.PlotWidget()
             self._review_plot_widget.setLabel("left", "磁场", units="mT")
             self._review_plot_widget.setLabel("bottom", "时间", units="s")
@@ -1192,6 +1339,10 @@ class GaussMeterGUI(QMainWindow):
                 pen=pg.mkPen("#00a651", width=1.0), name="频率/Hz"
             )
             self._review_freq_vb.addItem(self._review_freq_curve)
+            self._review_region = pg.LinearRegionItem()
+            self._review_region.setZValue(-10)
+            self._review_region.sigRegionChangeFinished.connect(self._on_review_region_changed)
+            self._review_plot_widget.addItem(self._review_region)
 
             def _update_review_freq_view():
                 self._review_freq_vb.setGeometry(plot_item.vb.sceneBoundingRect())
@@ -1199,12 +1350,154 @@ class GaussMeterGUI(QMainWindow):
 
             plot_item.vb.sigResized.connect(_update_review_freq_view)
 
-            layout.addWidget(self._review_plot_widget, 1)
+            time_plot_layout.addWidget(self._review_plot_widget)
+            self._review_plot_tabs.addTab(time_plot_page, "时间曲线 / Time")
+
+            heatmap_page = QWidget()
+            heatmap_layout = QVBoxLayout(heatmap_page)
+            heatmap_layout.setContentsMargins(0, 0, 0, 0)
+            heatmap_ctrl = QHBoxLayout()
+            heatmap_ctrl.addWidget(QLabel("值 / Value:"))
+            self._review_heatmap_channel_combo = QComboBox()
+            self._review_heatmap_channel_combo.currentTextChanged.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_channel_combo)
+            heatmap_ctrl.addWidget(QLabel("网格 / Grid:"))
+            self._review_heatmap_mode_combo = QComboBox()
+            self._review_heatmap_mode_combo.addItem("原始网格 / Raw", "raw")
+            self._review_heatmap_mode_combo.addItem("插值网格 / Interpolated", "interpolated")
+            self._review_heatmap_mode_combo.currentTextChanged.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_mode_combo)
+            heatmap_ctrl.addWidget(QLabel("分辨率 / Resolution:"))
+            self._review_heatmap_resolution_spin = QSpinBox()
+            self._review_heatmap_resolution_spin.setRange(10, 300)
+            self._review_heatmap_resolution_spin.setValue(80)
+            self._review_heatmap_resolution_spin.valueChanged.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_resolution_spin)
+            self._review_heatmap_auto_levels_cb = QCheckBox("自动色阶 / Auto Levels")
+            self._review_heatmap_auto_levels_cb.setChecked(True)
+            self._review_heatmap_auto_levels_cb.toggled.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_auto_levels_cb)
+            self._review_heatmap_min_edit = QLineEdit()
+            self._review_heatmap_min_edit.setPlaceholderText("min")
+            self._review_heatmap_min_edit.setFixedWidth(80)
+            self._review_heatmap_min_edit.editingFinished.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_min_edit)
+            self._review_heatmap_max_edit = QLineEdit()
+            self._review_heatmap_max_edit.setPlaceholderText("max")
+            self._review_heatmap_max_edit.setFixedWidth(80)
+            self._review_heatmap_max_edit.editingFinished.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_max_edit)
+            self._review_heatmap_contour_cb = QCheckBox("等值线 / Contour")
+            self._review_heatmap_contour_cb.toggled.connect(self._update_review_plot)
+            heatmap_ctrl.addWidget(self._review_heatmap_contour_cb)
+            self._review_heatmap_export_btn = QPushButton("导出 PNG / Export PNG")
+            self._review_heatmap_export_btn.clicked.connect(self._on_export_review_heatmap_image)
+            heatmap_ctrl.addWidget(self._review_heatmap_export_btn)
+            heatmap_ctrl.addStretch()
+            heatmap_layout.addLayout(heatmap_ctrl)
+            self._review_heatmap_status = QLabel("载入包含 x_mm/y_mm 的数据后显示空间热图")
+            self._review_heatmap_status.setStyleSheet("color: #555; padding: 4px;")
+            heatmap_layout.addWidget(self._review_heatmap_status)
+            heatmap_plot_row = QHBoxLayout()
+            self._review_heatmap_widget = pg.PlotWidget()
+            self._review_heatmap_widget.setLabel("bottom", "X", units="mm")
+            self._review_heatmap_widget.setLabel("left", "Y", units="mm")
+            self._review_heatmap_widget.showGrid(x=True, y=True, alpha=0.25)
+            self._review_heatmap_widget.setMinimumHeight(300)
+            self._review_heatmap_item = pg.ImageItem()
+            self._review_heatmap_contours = []
+            try:
+                cmap = pg.colormap.get("viridis")
+                self._review_heatmap_item.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+            except Exception:
+                pass
+            self._review_heatmap_widget.addItem(self._review_heatmap_item)
+            heatmap_plot_row.addWidget(self._review_heatmap_widget, 1)
+            self._review_heatmap_lut = pg.HistogramLUTWidget()
+            self._review_heatmap_lut.setImageItem(self._review_heatmap_item)
+            self._review_heatmap_lut.setMaximumWidth(110)
+            heatmap_plot_row.addWidget(self._review_heatmap_lut)
+            heatmap_layout.addLayout(heatmap_plot_row)
+            self._review_plot_tabs.addTab(heatmap_page, "空间热图 / Heatmap")
+
+            surface_page = QWidget()
+            surface_layout = QVBoxLayout(surface_page)
+            surface_layout.setContentsMargins(0, 0, 0, 0)
+            surface_ctrl = QHBoxLayout()
+            self._review_surface_reset_btn = QPushButton("Reset View")
+            self._review_surface_reset_btn.clicked.connect(self._reset_review_surface_view)
+            surface_ctrl.addWidget(self._review_surface_reset_btn)
+            self._review_surface_export_btn = QPushButton("Export 3D PNG")
+            self._review_surface_export_btn.clicked.connect(self._on_export_review_surface_image)
+            surface_ctrl.addWidget(self._review_surface_export_btn)
+            surface_ctrl.addStretch()
+            surface_layout.addLayout(surface_ctrl)
+            self._review_surface_status = QLabel(
+                "Load x_mm/y_mm data and install PyOpenGL to show 3D surface"
+            )
+            self._review_surface_status.setStyleSheet("color: #555; padding: 4px;")
+            surface_layout.addWidget(self._review_surface_status)
+            self._review_surface_widget = None
+            self._review_surface_item = None
+            self._review_surface_renderer = None
+            surface_error = ""
+            if SurfaceRenderer.is_available():
+                try:
+                    self._review_surface_renderer = SurfaceRenderer()
+                    self._review_surface_widget = self._review_surface_renderer.widget
+                    surface_layout.addWidget(self._review_surface_widget, 1)
+                except Exception as exc:
+                    self._review_surface_widget = None
+                    self._review_surface_renderer = None
+                    surface_error = f" OpenGL init failed: {exc}"
+            if self._review_surface_widget is None:
+                self._review_surface_export_btn.setEnabled(False)
+                self._review_surface_reset_btn.setEnabled(False)
+                missing = QLabel(
+                    "3D Surface requires optional PyOpenGL and a working OpenGL driver."
+                    " Other review plots remain available." + surface_error
+                )
+                missing.setAlignment(Qt.AlignCenter)
+                missing.setMinimumHeight(300)
+                surface_layout.addWidget(missing, 1)
+            self._review_plot_tabs.addTab(surface_page, "3D Surface")
+            self._review_plot_tabs.currentChanged.connect(self._on_review_plot_tab_changed)
+
+            layout.addWidget(self._review_plot_tabs, 1)
         else:
             self._review_plot_widget = None
+            self._review_region = None
+            self._review_heatmap_widget = None
+            self._review_heatmap_item = None
+            self._review_heatmap_lut = None
+            self._review_heatmap_status = None
+            self._review_heatmap_channel_combo = None
+            self._review_heatmap_auto_levels_cb = None
+            self._review_heatmap_min_edit = None
+            self._review_heatmap_max_edit = None
+            self._review_heatmap_contour_cb = None
+            self._review_heatmap_mode_combo = None
+            self._review_heatmap_resolution_spin = None
+            self._review_heatmap_export_btn = None
+            self._review_heatmap_contours = []
+            self._review_surface_status = None
+            self._review_surface_widget = None
+            self._review_surface_item = None
+            self._review_surface_renderer = None
+            self._review_surface_reset_btn = None
+            self._review_surface_export_btn = None
             no_plot = QLabel("pyqtgraph 未安装, 图表不可用 / pyqtgraph not installed")
             no_plot.setAlignment(Qt.AlignCenter)
             layout.addWidget(no_plot, 1)
+
+        self._review_table = QTableWidget()
+        self._review_table.setColumnCount(6)
+        self._review_table.setHorizontalHeaderLabels(["Seq", "Time(s)", "Field", "Freq", "Temp", "Source"])
+        self._review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._review_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._review_table.setMaximumHeight(180)
+        self._review_table.itemSelectionChanged.connect(self._on_review_table_selection_changed)
+        layout.addWidget(self._review_table)
 
         # 控制区
         ctrl_row = QHBoxLayout()
@@ -1215,6 +1508,40 @@ class GaussMeterGUI(QMainWindow):
         layout.addLayout(ctrl_row)
 
         return page
+
+    def _active_review_data(self) -> Optional[np.ndarray]:
+        if self._review_filtered_data is not None:
+            return self._review_filtered_data
+        return self._review_data
+
+    def _set_review_data(self, data: np.ndarray, *, files: Optional[List[Path]] = None) -> None:
+        self._review_data = data
+        self._review_filtered_data = None
+        if files is not None:
+            self._review_file_paths = list(dict.fromkeys(files))
+            self._update_review_file_info()
+        self._reset_review_filter_controls(update=False)
+        self._update_review_heatmap_channel_options(data)
+        self._update_review_plot()
+        self._update_review_stats()
+        self._update_review_table()
+
+    def _parse_optional_float(self, edit: QLineEdit) -> Optional[float]:
+        text = edit.text().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _reset_review_filter_controls(self, *args, update: bool = True) -> None:
+        self._review_seq_start_spin.setValue(0)
+        self._review_seq_end_spin.setValue(0)
+        self._review_time_start_edit.clear()
+        self._review_time_end_edit.clear()
+        if update:
+            self._reset_review_filter()
 
     def _update_review_file_info(self) -> None:
         count = len(self._review_file_paths)
@@ -1244,11 +1571,7 @@ class GaussMeterGUI(QMainWindow):
         if ok_count == 0:
             QMessageBox.warning(self, "加载失败", "未能成功加载任何文件。\nNo file loaded successfully.")
             return
-        self._review_data = data
-        self._review_file_paths = list(dict.fromkeys(paths))
-        self._update_review_file_info()
-        self._update_review_plot()
-        self._update_review_stats()
+        self._set_review_data(data, files=paths)
         self.log(f"[GUI] 数据回看: 已加载 {ok_count} 个文件, {len(data)} 个点")
 
     def _on_append_review_files(self) -> None:
@@ -1264,46 +1587,115 @@ class GaussMeterGUI(QMainWindow):
             QMessageBox.warning(self, "加载失败", "未能成功加载任何文件。\nNo file loaded successfully.")
             return
         if self._review_data is not None and len(self._review_data) > 0:
-            combined = np.concatenate([self._review_data, new_data])
-            combined.sort(order="timestamp_s")
-            _, unique_idx = np.unique(combined["timestamp_s"], return_index=True)
-            self._review_data = combined[np.sort(unique_idx)]
+            self._review_data = merge_review_arrays([self._review_data, new_data])
+            self._review_filtered_data = None
         else:
             self._review_data = new_data
         self._review_file_paths = list(dict.fromkeys(self._review_file_paths + paths))
         self._update_review_file_info()
+        self._update_review_heatmap_channel_options(self._review_data)
         self._update_review_plot()
         self._update_review_stats()
+        self._update_review_table()
         self.log(f"[GUI] 数据回看: 已追加 {ok_count} 个文件, 当前共 {len(self._review_data)} 个点")
 
     def _on_clear_review(self) -> None:
         self._review_data = None
+        self._review_filtered_data = None
         self._review_file_paths = []
         self._review_file_info.setText("未选择文件 / No files selected")
         if _HAS_PYG and self._review_plot_widget is not None:
             self._review_field_curve.clear()
             self._review_freq_curve.clear()
+            self._update_review_heatmap_channel_options(None)
+            self._update_review_heatmap(None)
+            self._update_review_surface(None)
         self._update_review_stats()
+        self._update_review_table()
         self.log("[GUI] 数据回看: 已清空")
 
-    def _update_review_plot(self) -> None:
+    def _on_load_review_from_database(self) -> None:
+        if self._db_store is None:
+            QMessageBox.warning(self, "数据库不可用", "SQLite 数据库尚未初始化。")
+            return
+        session_id = self._review_db_session_spin.value() or None
+        source = self._review_db_source_combo.currentText()
+        try:
+            data = self._db_store.query_samples(session_id=session_id, source=source)
+        except Exception as exc:
+            QMessageBox.critical(self, "数据库查询失败", str(exc))
+            self.log(f"[DB] 查询失败: {exc}")
+            return
+        if len(data) == 0:
+            QMessageBox.information(self, "无数据", "没有匹配的数据库样本。")
+            return
+        self._set_review_data(data, files=[])
+        self._review_file_info.setText(f"SQLite 查询 / {len(data):,} 点")
+        self.log(f"[DB] 已载入 {len(data)} 个数据库样本")
+
+    def _apply_review_filter(self) -> None:
+        if self._review_data is None or len(self._review_data) == 0:
+            return
+        seq_start = self._review_seq_start_spin.value() or None
+        seq_end = self._review_seq_end_spin.value() or None
+        time_start = self._parse_optional_float(self._review_time_start_edit)
+        time_end = self._parse_optional_float(self._review_time_end_edit)
+        source = self._review_db_source_combo.currentText()
+        session_id = self._review_db_session_spin.value() or None
+        self._review_filtered_data = filter_review_data(
+            self._review_data,
+            sequence_start=seq_start,
+            sequence_end=seq_end,
+            time_start_s=time_start,
+            time_end_s=time_end,
+            source=source,
+            session_id=session_id,
+        )
+        self._update_review_plot()
+        self._update_review_stats()
+        self._update_review_table()
+
+    def _reset_review_filter(self) -> None:
+        self._review_filtered_data = None
+        self._update_review_plot()
+        self._update_review_stats()
+        self._update_review_table()
+
+    def _update_review_plot(self, *_args) -> None:
         if not _HAS_PYG or self._review_plot_widget is None:
             return
-        if self._review_data is None or len(self._review_data) == 0:
+        data = self._active_review_data()
+        if data is None or len(data) == 0:
             self._review_field_curve.clear()
             self._review_freq_curve.clear()
+            self._update_review_heatmap(None)
+            self._update_review_surface(None)
             return
 
-        ts = self._review_data["timestamp_s"]
-        ts_rel = ts - ts[0]
-        # 优先 field_total_mt, 否则回退到 field_mt (兼容旧文件)
-        field_key = "field_total_mt" if "field_total_mt" in (self._review_data.dtype.names or ()) else "field_mt"
-        self._review_field_curve.setData(ts_rel, self._review_data[field_key])
+        active_tab = self._review_plot_tabs.currentIndex() if hasattr(self, "_review_plot_tabs") else 0
+        if active_tab == 1:
+            self._update_review_heatmap(data)
+        elif active_tab == 2:
+            self._update_review_surface(data)
+        else:
+            self._update_review_time_plot(data)
 
-        if self._review_show_freq_cb.isChecked() and "freq_hz" in (self._review_data.dtype.names or ()):
-            self._review_freq_curve.setData(ts_rel, self._review_data["freq_hz"])
+    def _on_review_plot_tab_changed(self, _index: int) -> None:
+        self._update_review_plot()
+
+    def _update_review_time_plot(self, data: np.ndarray) -> None:
+        if self._review_plot_widget is None:
+            return
+
+        ts = data["timestamp_s"]
+        ts_rel = ts - ts[0]
+        field_key = primary_field_name(data)
+        self._review_field_curve.setData(ts_rel, data[field_key])
+
+        if self._review_show_freq_cb.isChecked() and "freq_hz" in (data.dtype.names or ()):
+            self._review_freq_curve.setData(ts_rel, data["freq_hz"])
             self._review_freq_axis.setVisible(True)
-            freq = self._review_data["freq_hz"]
+            freq = data["freq_hz"]
             if len(freq) > 0:
                 margin = max(abs(freq.min()), abs(freq.max())) * 0.1 + 1e-6
                 self._review_freq_vb.setYRange(freq.min() - margin, freq.max() + margin, padding=0)
@@ -1311,11 +1703,344 @@ class GaussMeterGUI(QMainWindow):
             self._review_freq_curve.clear()
             self._review_freq_axis.setVisible(False)
 
-        # 自动缩放磁场轴和X轴
-        self._review_plot_widget.autoRange()
+        if self._review_region is not None and len(ts_rel) > 0:
+            self._review_region.blockSignals(True)
+            self._review_region.setRegion((float(ts_rel[0]), float(ts_rel[-1])))
+            self._review_region.blockSignals(False)
+
+        if self._review_auto_axis_cb.isChecked():
+            self._review_plot_widget.autoRange()
+        else:
+            try:
+                x_min = float(self._review_x_min_edit.text())
+                x_max = float(self._review_x_max_edit.text())
+                y_min = float(self._review_y_min_edit.text())
+                y_max = float(self._review_y_max_edit.text())
+                if x_max > x_min:
+                    self._review_plot_widget.setXRange(x_min, x_max, padding=0)
+                if y_max > y_min:
+                    self._review_plot_widget.setYRange(y_min, y_max, padding=0)
+            except ValueError:
+                self._review_plot_widget.autoRange()
+
+    def _update_review_heatmap(self, data: Optional[np.ndarray]) -> None:
+        if not _HAS_PYG or self._review_heatmap_item is None:
+            return
+        self._clear_review_heatmap_contours()
+        if data is None or len(data) == 0:
+            self._review_heatmap_item.clear()
+            if self._review_heatmap_status is not None:
+                self._review_heatmap_status.setText("没有可显示的数据")
+            return
+        names = data.dtype.names or ()
+        if "x_mm" not in names or "y_mm" not in names:
+            self._review_heatmap_item.clear()
+            if self._review_heatmap_status is not None:
+                self._review_heatmap_status.setText("当前数据没有 x_mm/y_mm 空间坐标")
+            return
+        value_key = self._selected_review_heatmap_channel(data)
+        try:
+            mode = self._review_heatmap_mode()
+            if mode == "interpolated":
+                resolution = self._review_heatmap_resolution()
+                xs, ys, grid = build_interpolated_heatmap_grid(
+                    data, value_key=value_key, resolution=resolution
+                )
+            else:
+                xs, ys, grid = build_heatmap_grid(data, value_key=value_key)
+        except ValueError as exc:
+            self._review_heatmap_item.clear()
+            if self._review_heatmap_status is not None:
+                self._review_heatmap_status.setText(str(exc))
+            return
+        if len(xs) == 0 or len(ys) == 0 or grid.size == 0:
+            self._review_heatmap_item.clear()
+            if self._review_heatmap_status is not None:
+                self._review_heatmap_status.setText("空间坐标或磁场值为空，无法生成热图")
+            return
+
+        dx = float(np.median(np.diff(xs))) if len(xs) > 1 else 1.0
+        dy = float(np.median(np.diff(ys))) if len(ys) > 1 else 1.0
+        if dx == 0.0 or not np.isfinite(dx):
+            dx = 1.0
+        if dy == 0.0 or not np.isfinite(dy):
+            dy = 1.0
+        x0 = float(xs[0]) - dx / 2.0
+        y0 = float(ys[0]) - dy / 2.0
+        width = float(xs[-1] - xs[0]) + dx
+        height = float(ys[-1] - ys[0]) + dy
+
+        image = np.array(grid.T, dtype=float)
+        levels = self._review_heatmap_levels(image)
+        if levels is None:
+            self._review_heatmap_item.setImage(image, autoLevels=True)
+        else:
+            self._review_heatmap_item.setImage(image, levels=levels, autoLevels=False)
+        self._review_heatmap_item.setRect(QRectF(x0, y0, width, height))
+        self._update_review_heatmap_contours(image)
+        if self._review_heatmap_status is not None:
+            finite_count = int(np.isfinite(grid).sum())
+            finite_values = grid[np.isfinite(grid)]
+            value_range = ""
+            if finite_values.size:
+                value_range = f"，范围 {float(finite_values.min()):.6g}..{float(finite_values.max()):.6g}"
+            mode_label = "插值" if self._review_heatmap_mode() == "interpolated" else "原始"
+            self._review_heatmap_status.setText(
+                f"{mode_label} {len(xs)} × {len(ys)} 网格，{finite_count} 个有效格，值: {value_key}{value_range}"
+            )
+        if self._review_heatmap_widget is not None:
+            self._review_heatmap_widget.autoRange()
+
+    def _review_heatmap_mode(self) -> str:
+        if self._review_heatmap_mode_combo is not None:
+            mode = self._review_heatmap_mode_combo.currentData()
+            if mode in {"raw", "interpolated"}:
+                return str(mode)
+        return "raw"
+
+    def _review_heatmap_resolution(self) -> int:
+        if self._review_heatmap_resolution_spin is not None:
+            return int(self._review_heatmap_resolution_spin.value())
+        return 80
+
+    def _update_review_heatmap_channel_options(self, data: Optional[np.ndarray]) -> None:
+        if not _HAS_PYG or self._review_heatmap_channel_combo is None:
+            return
+        current = self._review_heatmap_channel_combo.currentData()
+        names = data.dtype.names if data is not None else ()
+        options = []
+        for key, label in (
+            ("field_total", "Total B"),
+            ("field_x", "X"),
+            ("field_y", "Y"),
+            ("field_z", "Z"),
+            ("field_total_mt", "Total B (mT alias)"),
+            ("field_x_mt", "X (mT alias)"),
+            ("field_y_mt", "Y (mT alias)"),
+            ("field_z_mt", "Z (mT alias)"),
+        ):
+            if names and key in names:
+                values = np.asarray(data[key], dtype=float)
+                if np.any(np.isfinite(values)):
+                    options.append((label, key))
+        if not options and names:
+            key = primary_field_name(data)
+            options.append((key, key))
+
+        self._review_heatmap_channel_combo.blockSignals(True)
+        try:
+            self._review_heatmap_channel_combo.clear()
+            for label, key in options:
+                self._review_heatmap_channel_combo.addItem(label, key)
+            index = self._review_heatmap_channel_combo.findData(current)
+            if index >= 0:
+                self._review_heatmap_channel_combo.setCurrentIndex(index)
+        finally:
+            self._review_heatmap_channel_combo.blockSignals(False)
+
+    def _selected_review_heatmap_channel(self, data: np.ndarray) -> str:
+        if self._review_heatmap_channel_combo is not None:
+            selected = self._review_heatmap_channel_combo.currentData()
+            if selected in (data.dtype.names or ()):
+                return str(selected)
+        return primary_field_name(data)
+
+    def _review_heatmap_levels(self, image: np.ndarray) -> Optional[Tuple[float, float]]:
+        if self._review_heatmap_auto_levels_cb is None or self._review_heatmap_auto_levels_cb.isChecked():
+            finite = image[np.isfinite(image)]
+            if finite.size and self._review_heatmap_min_edit is not None and self._review_heatmap_max_edit is not None:
+                self._review_heatmap_min_edit.blockSignals(True)
+                self._review_heatmap_max_edit.blockSignals(True)
+                try:
+                    self._review_heatmap_min_edit.setText(f"{float(finite.min()):.6g}")
+                    self._review_heatmap_max_edit.setText(f"{float(finite.max()):.6g}")
+                finally:
+                    self._review_heatmap_min_edit.blockSignals(False)
+                    self._review_heatmap_max_edit.blockSignals(False)
+            return None
+        try:
+            low = float(self._review_heatmap_min_edit.text()) if self._review_heatmap_min_edit is not None else 0.0
+            high = float(self._review_heatmap_max_edit.text()) if self._review_heatmap_max_edit is not None else 1.0
+        except ValueError:
+            return None
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            return None
+        return (low, high)
+
+    def _clear_review_heatmap_contours(self) -> None:
+        for contour in getattr(self, "_review_heatmap_contours", []):
+            try:
+                contour.setParentItem(None)
+                if self._review_heatmap_widget is not None:
+                    self._review_heatmap_widget.removeItem(contour)
+            except Exception:
+                pass
+        self._review_heatmap_contours = []
+
+    def _update_review_heatmap_contours(self, image: np.ndarray) -> None:
+        if self._review_heatmap_contour_cb is None or not self._review_heatmap_contour_cb.isChecked():
+            return
+        finite = image[np.isfinite(image)]
+        if finite.size < 4:
+            return
+        low = float(finite.min())
+        high = float(finite.max())
+        if high <= low:
+            return
+        for level in np.linspace(low, high, 7)[1:-1]:
+            contour = pg.IsocurveItem(data=image, level=float(level), pen=pg.mkPen("#202020", width=1))
+            contour.setParentItem(self._review_heatmap_item)
+            contour.setZValue(10)
+            self._review_heatmap_contours.append(contour)
+
+    def _on_export_review_heatmap_image(self) -> None:
+        if not _HAS_PYG or self._review_heatmap_widget is None or self._review_heatmap_item is None:
+            QMessageBox.information(self, "图表不可用", "pyqtgraph 未安装或热图尚未初始化。")
+            return
+        image = getattr(self._review_heatmap_item, "image", None)
+        if image is None or np.asarray(image).size == 0:
+            QMessageBox.information(self, "无热图", "当前没有可导出的空间热图。")
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出空间热图 / Export Heatmap", "spatial_heatmap.png", "PNG Images (*.png)"
+        )
+        if not out:
+            return
+        try:
+            pixmap = self._review_heatmap_widget.grab()
+            if not pixmap.save(out, "PNG"):
+                raise OSError("QPixmap.save returned false")
+            if self._db_store is not None:
+                session_id = self._review_db_session_spin.value() or self._db_session_id
+                self._db_store.record_export(path=out, export_type="heatmap_png", session_id=session_id)
+            self.log(f"[GUI] 空间热图已导出: {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+
+    def _update_review_surface(self, data: Optional[np.ndarray]) -> None:
+        if self._review_surface_status is None:
+            return
+        renderer = getattr(self, "_review_surface_renderer", None)
+        if renderer is None:
+            self._review_surface_status.setText(
+                "3D Surface requires optional PyOpenGL; install requirements-optional.txt to enable it."
+            )
+            return
+        self._clear_review_surface()
+        if data is None or len(data) == 0:
+            self._review_surface_status.setText("没有可显示的数据 / No data")
+            return
+        names = data.dtype.names or ()
+        if "x_mm" not in names or "y_mm" not in names:
+            self._review_surface_status.setText("当前数据没有 x_mm/y_mm 空间坐标")
+            return
+        value_key = self._selected_review_heatmap_channel(data)
+        try:
+            xs, ys, grid = build_surface_grid(
+                data,
+                value_key=value_key,
+                resolution=self._review_heatmap_resolution(),
+                interpolated=self._review_heatmap_mode() == "interpolated",
+            )
+        except ValueError as exc:
+            self._review_surface_status.setText(str(exc))
+            return
+        if len(xs) == 0 or len(ys) == 0 or grid.size == 0:
+            self._review_surface_status.setText("空间坐标或磁场值为空，无法生成 3D surface")
+            return
+        finite = grid[np.isfinite(grid)]
+        if finite.size == 0:
+            self._review_surface_status.setText("3D surface 没有有效数值")
+            return
+
+        z_grid = np.asarray(grid, dtype=float).T
+        levels = self._review_heatmap_levels(z_grid)
+        colors = self._review_surface_colors(z_grid, levels)
+
+        try:
+            renderer.set_surface(np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), grid, colors)
+            self._review_surface_item = renderer.has_surface
+            self._review_surface_export_btn.setEnabled(True)
+            self._review_surface_reset_btn.setEnabled(True)
+            mode_label = "Interpolated" if self._review_heatmap_mode() == "interpolated" else "Raw"
+            self._review_surface_status.setText(
+                f"{mode_label} 3D surface {len(xs)} × {len(ys)}, value: {value_key}, "
+                f"range {float(finite.min()):.6g}..{float(finite.max()):.6g}; "
+                "X/Y are centered for display."
+            )
+        except Exception as exc:
+            self._clear_review_surface()
+            self._review_surface_status.setText(f"3D surface render failed: {exc}")
+
+    def _review_surface_colors(
+        self, z_grid: np.ndarray, levels: Optional[Tuple[float, float]]
+    ) -> np.ndarray:
+        finite = z_grid[np.isfinite(z_grid)]
+        if finite.size == 0:
+            low, high = 0.0, 1.0
+        elif levels is not None:
+            low, high = levels
+        else:
+            low, high = float(finite.min()), float(finite.max())
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            high = low + 1.0
+
+        ratio = (z_grid - low) / (high - low)
+        ratio = np.clip(np.nan_to_num(ratio, nan=0.0), 0.0, 1.0)
+        colors = np.zeros(z_grid.shape + (4,), dtype=float)
+        stops = np.array([
+            [0.13, 0.40, 0.67],
+            [0.40, 0.66, 0.81],
+            [1.00, 1.00, 0.75],
+            [0.70, 0.09, 0.17],
+        ], dtype=float)
+        first = ratio <= 0.35
+        second = (ratio > 0.35) & (ratio <= 0.65)
+        third = ratio > 0.65
+        for mask, left, right, denom, offset in (
+            (first, stops[0], stops[1], 0.35, 0.0),
+            (second, stops[1], stops[2], 0.30, 0.35),
+            (third, stops[2], stops[3], 0.35, 0.65),
+        ):
+            if np.any(mask):
+                local = ((ratio[mask] - offset) / denom).reshape(-1, 1)
+                colors[mask, :3] = left + (right - left) * local
+        colors[..., 3] = np.where(np.isfinite(z_grid), 1.0, 0.0)
+        return colors.reshape((-1, 4))
+
+    def _clear_review_surface(self) -> None:
+        renderer = getattr(self, "_review_surface_renderer", None)
+        if renderer is not None:
+            renderer.clear()
+        self._review_surface_item = None
+
+    def _reset_review_surface_view(self) -> None:
+        renderer = getattr(self, "_review_surface_renderer", None)
+        if renderer is not None:
+            renderer.reset_view()
+
+    def _on_export_review_surface_image(self) -> None:
+        renderer = getattr(self, "_review_surface_renderer", None)
+        if renderer is None or not renderer.has_surface:
+            QMessageBox.information(self, "3D 不可用", "当前没有可导出的 3D Surface。")
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出 3D Surface / Export 3D Surface", "spatial_surface_3d.png", "PNG Images (*.png)"
+        )
+        if not out:
+            return
+        try:
+            renderer.export_png(out)
+            if self._db_store is not None:
+                session_id = self._review_db_session_spin.value() or self._db_session_id
+                self._db_store.record_export(path=out, export_type="surface_3d_png", session_id=session_id)
+            self.log(f"[GUI] 3D Surface 已导出: {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
 
     def _update_review_stats(self) -> None:
-        if self._review_data is None or len(self._review_data) == 0:
+        data = self._active_review_data()
+        if data is None or len(data) == 0:
             self._review_stat_count.setText("--")
             self._review_stat_duration.setText("--")
             self._review_stat_min.setText("--")
@@ -1323,7 +2048,7 @@ class GaussMeterGUI(QMainWindow):
             self._review_stat_mean.setText("--")
             self._review_stat_channels.setText("")
             return
-        summary = get_review_summary(self._review_data)
+        summary = get_review_summary(data)
         self._review_stat_count.setText(f"{summary['count']:,}")
         self._review_stat_duration.setText(f"{summary['duration_s']:.3f} s")
         self._review_stat_min.setText(f"{summary['field_min']:.6f}")
@@ -1335,7 +2060,7 @@ class GaussMeterGUI(QMainWindow):
         for ch_name, ch_stats in summary.get("channels", {}).items():
             if ch_name in ("freq_hz", "temp_c"):
                 continue
-            label = {"field_x_mt": "X", "field_y_mt": "Y", "field_z_mt": "Z", "field_total_mt": "Total", "field_mt": "Field"}.get(ch_name, ch_name)
+            label = {"field_x": "X", "field_y": "Y", "field_z": "Z", "field_total": "Total"}.get(ch_name, ch_name)
             ch_lines.append(
                 f"{label}: min={ch_stats['min']:.4f} max={ch_stats['max']:.4f} mean={ch_stats['mean']:.4f}"
             )
@@ -1343,6 +2068,147 @@ class GaussMeterGUI(QMainWindow):
             self._review_stat_channels.setText(" | ".join(ch_lines))
         else:
             self._review_stat_channels.setText("")
+
+    def _update_review_table(self) -> None:
+        data = self._active_review_data()
+        self._review_table_updating = True
+        try:
+            self._review_table.setRowCount(0)
+            if data is None or len(data) == 0:
+                return
+            field_key = primary_field_name(data)
+            limit = min(len(data), 500)
+            self._review_table.setRowCount(limit)
+            for row_idx in range(limit):
+                row = data[row_idx]
+                values = [
+                    str(int(row["sequence"])),
+                    f"{float(row['timestamp_s'] - data['timestamp_s'][0]):.6f}",
+                    f"{float(row[field_key]):.6f}",
+                    f"{float(row['freq_hz']):.3f}",
+                    f"{float(row['temp_c']):.3f}",
+                    str(row["source"]),
+                ]
+                for col_idx, value in enumerate(values):
+                    self._review_table.setItem(row_idx, col_idx, QTableWidgetItem(value))
+            self._review_table.resizeColumnsToContents()
+        finally:
+            self._review_table_updating = False
+
+    def _on_review_table_selection_changed(self) -> None:
+        if self._review_table_updating:
+            return
+        rows = {idx.row() for idx in self._review_table.selectedIndexes()}
+        if not rows:
+            return
+        sequences = []
+        for row in rows:
+            item = self._review_table.item(row, 0)
+            if item is not None:
+                try:
+                    sequences.append(int(item.text()))
+                except ValueError:
+                    pass
+        if not sequences:
+            return
+        self._review_seq_start_spin.setValue(min(sequences))
+        self._review_seq_end_spin.setValue(max(sequences))
+        self._apply_review_filter()
+
+    def _on_review_region_changed(self) -> None:
+        if self._review_region is None:
+            return
+        start, end = self._review_region.getRegion()
+        self._review_time_start_edit.setText(f"{float(start):.6f}")
+        self._review_time_end_edit.setText(f"{float(end):.6f}")
+
+    def _save_review_view_preset(self) -> None:
+        review_cfg = self._cfg.setdefault("review", {})
+        review_cfg["manual_axis_enabled"] = not self._review_auto_axis_cb.isChecked()
+        for key, edit in (
+            ("x_min_s", self._review_x_min_edit),
+            ("x_max_s", self._review_x_max_edit),
+            ("y_min", self._review_y_min_edit),
+            ("y_max", self._review_y_max_edit),
+        ):
+            try:
+                review_cfg[key] = float(edit.text())
+            except ValueError:
+                pass
+        review_cfg["default_source"] = self._review_db_source_combo.currentText()
+        save_config(self._cfg)
+        self.log("[GUI] 回看视图配置已保存")
+
+    def _on_export_review_selection(self) -> None:
+        data = self._active_review_data()
+        if data is None or len(data) == 0:
+            QMessageBox.information(self, "无数据", "当前没有可导出的选区数据。")
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出选区 CSV / Export Selection", "review_selection.csv", "CSV Files (*.csv)"
+        )
+        if not out:
+            return
+        try:
+            export_review_selection_csv(Path(out), data)
+            if self._db_store is not None:
+                session_id = self._review_db_session_spin.value() or self._db_session_id
+                self._db_store.record_export(path=out, export_type="selection_csv", session_id=session_id)
+            self.log(f"[GUI] 选区 CSV 已导出: {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+
+    def _on_export_review_report(self) -> None:
+        data = self._active_review_data()
+        if data is None or len(data) == 0:
+            QMessageBox.information(self, "无数据", "当前没有可生成报告的数据。")
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "导出 HTML 报告 / Export HTML Report", "m1600_report.html", "HTML Files (*.html)"
+        )
+        if not out:
+            return
+        metadata = {
+            "device_model": self._device_model,
+            "display_unit": self._display_unit,
+            "source": self._review_db_source_combo.currentText(),
+            "database": self._cfg.get("database", {}).get("path", ""),
+        }
+        if self._review_file_paths:
+            file_hashes = []
+            for path in self._review_file_paths:
+                try:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    file_hashes.append(f"{path.name}: {digest}")
+                except OSError:
+                    file_hashes.append(f"{path.name}: unreadable")
+            metadata["input_file_sha256"] = " | ".join(file_hashes)
+        try:
+            threshold = evaluate_threshold(
+                data,
+                low=float(self._low_thresh_edit.text() or 0.0),
+                high=float(self._up_thresh_edit.text() or 0.0),
+                channel=self._threshold_channel_key(),
+                absolute=self._judge_abs_cb.isChecked(),
+                mode="open" if self._judge_mode_combo.currentIndex() == 1 else "closed",
+            )
+        except ValueError:
+            threshold = {"enabled": False, "status": "INVALID_THRESHOLD"}
+        try:
+            export_html_report(
+                Path(out),
+                data,
+                metadata=metadata,
+                threshold=threshold,
+                include_heatmap=True,
+                heatmap_value_key=self._selected_review_heatmap_channel(data),
+            )
+            if self._db_store is not None:
+                session_id = self._review_db_session_spin.value() or self._db_session_id
+                self._db_store.record_export(path=out, export_type="html_report", session_id=session_id)
+            self.log(f"[GUI] HTML 报告已导出: {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "报告失败", str(exc))
 
     # ==================================================================
     # 页面 4: 调试
@@ -1405,10 +2271,10 @@ class GaussMeterGUI(QMainWindow):
         try:
             if self._debug_tx_hex_cb.isChecked():
                 data = bytes(int(b, 16) for b in text.split())
-                self._ctrl.driver._serial.write(data)
+                self._ctrl.driver._send_raw(data)
                 self._debug_rx_text.append(f'<span style="color:#00a651;">[TX-Hex] {data.hex(" ")}</span>')
             else:
-                self._ctrl.driver._send_command(text.rstrip(">"))
+                self._ctrl.driver._send_command(text)
                 self._debug_rx_text.append(f'<span style="color:#00a651;">[TX] {text}</span>')
         except Exception as exc:
             self.log(f"[DEBUG] 发送失败: {exc}")
@@ -1540,8 +2406,58 @@ class GaussMeterGUI(QMainWindow):
 
     def _convert_field_display(self, field_mt: float) -> float:
         """将原始 mT 值按当前显示单位换算。"""
-        conv = self._UNIT_CONVERSION_BY_MODEL.get(self._device_model, {})
-        return field_mt * conv.get(self._display_unit, 1.0)
+        return field_mt * self._UNIT_CONVERSION.get(self._display_unit, 1.0)
+
+    def _primary_field_channel(self) -> str:
+        channels = self._buffer.get_channels()
+        for channel in ("field_mt", "field_total_mt", "field_x_mt"):
+            if channel in channels:
+                return channel
+        return "field_mt"
+
+    def _populate_threshold_channel_combo(self, selected_key: str = "field_total") -> None:
+        if not hasattr(self, "_judge_channel_combo"):
+            return
+        label_map = {
+            "field_total": "Total B",
+            "field_x": "X",
+            "field_y": "Y",
+            "field_z": "Z",
+        }
+        cap = get_device_capability(self._device_model)
+        self._judge_channel_combo.blockSignals(True)
+        try:
+            self._judge_channel_combo.clear()
+            for key in cap.threshold_channels:
+                self._judge_channel_combo.addItem(label_map.get(key, key), key)
+            index = self._judge_channel_combo.findData(selected_key)
+            if index < 0:
+                index = self._judge_channel_combo.findData("field_total")
+            self._judge_channel_combo.setCurrentIndex(max(0, index))
+        finally:
+            self._judge_channel_combo.blockSignals(False)
+        self._cfg.setdefault("acquisition", {})["threshold_channel"] = self._threshold_channel_key()
+
+    def _threshold_channel_key(self) -> str:
+        if hasattr(self, "_judge_channel_combo"):
+            selected = self._judge_channel_combo.currentData()
+            if selected:
+                return str(selected)
+        return "field_total"
+
+    def _threshold_value_from_latest(self, latest: Dict[str, float]) -> float:
+        key = self._threshold_channel_key()
+        if key == "field_x":
+            return latest.get("field_x_mt", latest.get("field_mt", latest.get("field_total_mt", 0.0)))
+        if key == "field_y":
+            return latest.get("field_y_mt", 0.0)
+        if key == "field_z":
+            return latest.get("field_z_mt", 0.0)
+        return latest.get("field_total_mt", latest.get("field_mt", latest.get("field_x_mt", 0.0)))
+
+    def _on_threshold_channel_changed(self) -> None:
+        self._cfg.setdefault("acquisition", {})["threshold_channel"] = self._threshold_channel_key()
+        save_config(self._cfg)
 
     def _on_display_unit_changed(self, unit: str) -> None:
         """显示单位变更: 更新换算系数并保存配置。"""
@@ -1550,7 +2466,7 @@ class GaussMeterGUI(QMainWindow):
         save_config(self._cfg)
         self.log(f"[GUI] 显示单位已切换: {unit}")
         # 立即刷新当前显示值
-        latest = self._buffer.get_latest("field_mt")
+        latest = self._buffer.get_latest(self._primary_field_channel())
         if latest != 0.0:
             mode = self._get_active_acq_mode()
             dec = mode["decimals"]
@@ -1599,9 +2515,8 @@ class GaussMeterGUI(QMainWindow):
             return
 
         self._device_model = new_model
-        self._UNIT_CONVERSION = self._UNIT_CONVERSION_BY_MODEL.get(
-            new_model, self._UNIT_CONVERSION_BY_MODEL["1d_gauss"]
-        )
+        cap = get_device_capability(new_model)
+        self._UNIT_CONVERSION = dict(cap.display_scales)
 
         # 更新显示单位下拉框
         self._display_unit_combo.clear()
@@ -1619,14 +2534,15 @@ class GaussMeterGUI(QMainWindow):
 
         # 重新初始化环形缓冲区通道
         self._reinit_buffer_for_model(new_model)
+        self._populate_threshold_channel_combo(self._threshold_channel_key())
 
         # 更新图表分量曲线可见性
         if hasattr(self, '_field_x_curve'):
-            self._field_x_curve.setVisible(new_model in ("2d_gauss", "3d_gauss", "3d_fluxgate"))
+            self._field_x_curve.setVisible("field_x_mt" in cap.stream_channels)
         if hasattr(self, '_field_y_curve'):
-            self._field_y_curve.setVisible(new_model in ("2d_gauss", "3d_gauss", "3d_fluxgate"))
+            self._field_y_curve.setVisible("field_y_mt" in cap.stream_channels)
         if hasattr(self, '_field_z_curve'):
-            self._field_z_curve.setVisible(new_model in ("3d_gauss", "3d_fluxgate"))
+            self._field_z_curve.setVisible("field_z_mt" in cap.stream_channels)
 
         # 保存配置
         self._cfg["device_model"] = new_model
@@ -1636,16 +2552,7 @@ class GaussMeterGUI(QMainWindow):
 
     def _reinit_buffer_for_model(self, model: str) -> None:
         """根据设备型号重新初始化环形缓冲区通道。"""
-        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
-            channels = ["field_mt", "freq_hz", "temp_c"]
-        elif model == "2d_gauss":
-            channels = ["field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"]
-        elif model == "3d_gauss":
-            channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"]
-        elif model == "3d_fluxgate":
-            channels = ["field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"]
-        else:
-            channels = ["field_mt", "freq_hz", "temp_c"]
+        channels = list(get_device_capability(model).stream_channels)
         self._buffer = CircularBuffer(channels=channels, capacity=self._buffer.capacity)
 
     def _get_active_acq_mode(self) -> dict:
@@ -1657,36 +2564,43 @@ class GaussMeterGUI(QMainWindow):
 
     def _default_unit_for_model(self) -> str:
         """根据设备模型返回默认显示单位。"""
-        if self._device_model in ("1d_gauss", "2d_gauss", "3d_gauss"):
-            return "mT"
-        elif self._device_model == "fluxmeter":
-            return "mWb"
-        elif self._device_model in ("1d_fluxgate", "3d_fluxgate"):
-            return "nT"
-        else:
-            return "mT"
+        return get_device_capability(self._device_model).field_unit
 
     def _get_display_unit_options(self, model: str) -> List[str]:
         """根据设备模型返回可用的显示单位选项。"""
-        if model in ("1d_gauss", "2d_gauss", "3d_gauss"):
-            return ["mT", "G", "Oe", "A/m", "mGs"]
-        elif model == "fluxmeter":
-            return ["mWb"]
-        elif model in ("1d_fluxgate", "3d_fluxgate"):
-            return ["nT"]
-        else:
-            return ["mT", "G", "Oe", "A/m", "mGs"]
+        return list(get_device_capability(model).available_units)
 
     def _get_table_columns(self, model: str) -> List[str]:
         """根据设备模型返回实时数据表格的列标题。"""
-        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
-            return ["序号 / #", "磁场 / Field (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
-        elif model == "2d_gauss":
-            return ["序号 / #", "X (mT)", "Y (mT)", "Total B (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
-        elif model in ("3d_gauss", "3d_fluxgate"):
-            return ["序号 / #", "X (mT)", "Y (mT)", "Z (mT)", "Total B (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
+        return list(get_device_capability(model).table_columns)
+
+    def _on_probe_profile_changed(self) -> None:
+        profile_name = self._probe_profile_combo.currentData()
+        if not profile_name:
+            return
+        self._probe_profile = str(profile_name)
+        profile = get_probe_profile(self._probe_profile)
+        self._cfg["probe_profile"] = self._probe_profile
+        save_config(self._cfg)
+        self.log(f"[GUI] 探头档案已切换: {profile.label}")
+
+    def _live_table_row_values(self, sequence: int, point: Dict[str, float]) -> List[str]:
+        cap = get_device_capability(self._device_model)
+        values = [str(sequence)]
+        if cap.measurement_dimension == 1:
+            values.append(f"{point.get('field_mt', point.get('field_total_mt', 0.0)):.6f}")
         else:
-            return ["序号 / #", "磁场 / Field (mT)", "频率 / Freq (Hz)", "温度 / Temp (°C)", "时间戳 / Timestamp"]
+            values.append(f"{point.get('field_x_mt', 0.0):.6f}")
+            values.append(f"{point.get('field_y_mt', 0.0):.6f}")
+            if cap.measurement_dimension >= 3:
+                values.append(f"{point.get('field_z_mt', 0.0):.6f}")
+            values.append(f"{point.get('field_total_mt', 0.0):.6f}")
+        if cap.has_freq:
+            values.append(f"{point.get('freq_hz', 0.0):.1f}")
+        if cap.has_temp:
+            values.append(f"{point.get('temp_c', 0.0):.1f}")
+        values.append(f"{point.get('timestamp_s', 0.0):.6f}")
+        return values
 
     def _on_cycle_unit(self) -> None:
         if self._cmd_service:
@@ -1747,7 +2661,7 @@ class GaussMeterGUI(QMainWindow):
     def _on_set_zero(self) -> None:
         """以当前读数为零点，后续数据均减去此偏移。"""
         # 从 buffer 取的是已修正值，需加回当前 offset 得到原始仪器值
-        field_display = self._buffer.get_latest("field_mt")
+        field_display = self._buffer.get_latest(self._primary_field_channel())
         self._zero_offset = field_display + self._zero_offset
         offset_display = self._convert_field_display(self._zero_offset)
         self._zero_offset_label.setText(
@@ -1773,8 +2687,34 @@ class GaussMeterGUI(QMainWindow):
 
     def _on_clear_data_table(self) -> None:
         """清空实时数据表格。"""
+        self._pending_live_table_rows.clear()
         self._data_table.setRowCount(0)
         self.log("[GUI] 数据表格已清空")
+
+    def _flush_live_table_rows(self) -> None:
+        if not self._pending_live_table_rows or not self._data_table.isVisible():
+            return
+        rows = self._pending_live_table_rows
+        self._pending_live_table_rows = []
+        max_rows = self._table_max_rows_spin.value()
+        if len(rows) >= max_rows:
+            rows = rows[-max_rows:]
+            self._data_table.setRowCount(0)
+
+        self._data_table.setUpdatesEnabled(False)
+        try:
+            overflow = self._data_table.rowCount() + len(rows) - max_rows
+            if overflow > 0:
+                for _ in range(min(overflow, self._data_table.rowCount())):
+                    self._data_table.removeRow(0)
+            for values in rows:
+                row = self._data_table.rowCount()
+                self._data_table.insertRow(row)
+                for col_idx, value in enumerate(values):
+                    self._data_table.setItem(row, col_idx, QTableWidgetItem(value))
+        finally:
+            self._data_table.setUpdatesEnabled(True)
+        self._data_table.scrollToBottom()
 
     def _on_clear_chart(self) -> None:
         """清空图表数据和缓冲区。"""
@@ -1900,7 +2840,11 @@ class GaussMeterGUI(QMainWindow):
         self.log("[GUI] 数据采集已启动")
         # 启动外部 IPC
         if self._ipc_enabled_cb.isChecked():
-            self._ipc_service.start()
+            try:
+                self._ipc_service.start()
+            except Exception as exc:
+                self._ipc_enabled_cb.setChecked(False)
+                self.log(f"[GUI] ZMQ IPC 启动失败: {exc}")
         if self._ipc_namedpipe_cb.isChecked():
             self._ipc_service.start_namedpipe(
                 self._cfg.get("external_ipc", {}).get("namedpipe_name", "m1600_control")
@@ -1941,6 +2885,24 @@ class GaussMeterGUI(QMainWindow):
         )
         try:
             file_path = self._recorder.start()
+            self._db_session_id = None
+            if self._db_store is not None:
+                try:
+                    mode_key = self._sample_rate_combo.currentData() or "dc_normal"
+                    self._db_session_id = self._db_store.create_session(
+                        device_model=self._device_model,
+                        probe_profile=self._probe_profile,
+                        mode_key=mode_key,
+                        display_unit=self._display_unit,
+                        range_label=self._range_label.text(),
+                        up_threshold=float(self._up_thresh_edit.text() or 0.0),
+                        low_threshold=float(self._low_thresh_edit.text() or 0.0),
+                        threshold_channel=self._threshold_channel_key(),
+                        source="realtime",
+                        notes=f"csv={file_path}",
+                    )
+                except Exception as exc:
+                    self.log(f"[DB] 创建 session 失败: {exc}")
             self._rec_start_btn.setEnabled(False)
             self._rec_stop_btn.setEnabled(True)
             self._rec_stats_label.setText(f"记录中: {file_path.name} | 0 行 | 0.0 MB")
@@ -1962,6 +2924,12 @@ class GaussMeterGUI(QMainWindow):
             row_count = self._recorder.row_count
             file_path = self._recorder.file_path
             self._recorder = None
+            if self._db_store is not None and self._db_session_id is not None:
+                try:
+                    self._db_store.close_session(self._db_session_id)
+                except Exception as exc:
+                    self.log(f"[DB] 关闭 session 失败: {exc}")
+                self._db_session_id = None
             self.log(f"[GUI] 停止记录: {file_path} ({row_count} 行)")
         self._rec_start_btn.setEnabled(True)
         self._rec_stop_btn.setEnabled(False)
@@ -1986,6 +2954,12 @@ class GaussMeterGUI(QMainWindow):
             self._rec_start_btn.setEnabled(True)
             self._rec_stop_btn.setEnabled(False)
             self._recorder = None
+            if self._db_store is not None and self._db_session_id is not None:
+                try:
+                    self._db_store.close_session(self._db_session_id)
+                except Exception:
+                    pass
+                self._db_session_id = None
             self._update_global_bar(
                 self._ctrl.is_connected if self._ctrl else False,
                 self._ctrl.is_streaming if self._ctrl else False,
@@ -2081,47 +3055,47 @@ class GaussMeterGUI(QMainWindow):
     def _update_live_display(self, latest: Dict[str, float], mode: dict, dec: int) -> None:
         """根据设备型号更新实时数值显示 (Field/Freq/Temp)。"""
         model = self._device_model
+        cap = get_device_capability(model)
         unit = self._display_unit
 
-        if model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
+        if cap.measurement_dimension == 1:
             field_raw = latest.get("field_mt", 0.0)
             field_display = self._convert_field_display(field_raw - self._zero_offset)
             self._field_label.setText(f"{field_display:.{dec}f} {unit}")
-            self._update_judge_status(field_raw - self._zero_offset)
-        elif model == "2d_gauss":
+            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+        elif cap.measurement_dimension == 2:
             x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
             y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
             t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
             self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} B:{t:.{dec}f} {unit}")
-            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
-        elif model == "3d_gauss":
+            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
+        elif cap.measurement_dimension == 3:
             x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
             y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
             z = self._convert_field_display(latest.get("field_z_mt", 0.0) - self._zero_offset)
             t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
             self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} Z:{z:.{dec}f} B:{t:.{dec}f} {unit}")
-            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
-        elif model == "3d_fluxgate":
-            x = self._convert_field_display(latest.get("field_x_mt", 0.0) - self._zero_offset)
-            y = self._convert_field_display(latest.get("field_y_mt", 0.0) - self._zero_offset)
-            z = self._convert_field_display(latest.get("field_z_mt", 0.0) - self._zero_offset)
-            t = self._convert_field_display(latest.get("field_total_mt", 0.0) - self._zero_offset)
-            self._field_label.setText(f"X:{x:.{dec}f} Y:{y:.{dec}f} Z:{z:.{dec}f} B:{t:.{dec}f} {unit}")
-            self._update_judge_status(latest.get("field_total_mt", 0.0) - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
         else:
             field_raw = latest.get("field_mt", 0.0)
             field_display = self._convert_field_display(field_raw - self._zero_offset)
             self._field_label.setText(f"{field_display:.{dec}f} {unit}")
-            self._update_judge_status(field_raw - self._zero_offset)
+            self._update_judge_status(self._threshold_value_from_latest(latest) - self._zero_offset)
 
-        freq = latest.get("freq_hz", 0.0)
-        if freq < 0.01:
-            self._freq_label.setText("DC")
+        if cap.has_freq:
+            freq = latest.get("freq_hz", 0.0)
+            if freq < 0.01:
+                self._freq_label.setText("DC")
+            else:
+                self._freq_label.setText(f"{freq:.0f} Hz")
         else:
-            self._freq_label.setText(f"{freq:.0f} Hz")
+            self._freq_label.setText("—")
 
-        temp = latest.get("temp_c", 0.0)
-        self._temp_label.setText(f"{temp:.1f} °C")
+        if cap.has_temp:
+            temp = latest.get("temp_c", 0.0)
+            self._temp_label.setText(f"{temp:.1f} °C")
+        else:
+            self._temp_label.setText("—")
 
     def _update_judge_status(self, field_mt: float) -> None:
         """阈值判断: 根据上下限和判断模式更新状态标签。"""
@@ -2212,53 +3186,12 @@ class GaussMeterGUI(QMainWindow):
 
         # 更新实时数据表格
         if self._data_table.isVisible():
-            max_rows = self._table_max_rows_spin.value()
             for i, p in enumerate(points):
-                row = self._data_table.rowCount()
-                if row >= max_rows:
-                    self._data_table.removeRow(0)
-                    row = max_rows - 1
-                self._data_table.insertRow(row)
-                self._data_table.setItem(row, 0, QTableWidgetItem(str(self._total_points - len(points) + i + 1)))
-                if self._device_model in ("1d_gauss", "fluxmeter", "1d_fluxgate"):
-                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
-                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
-                    ts = p.get("timestamp_s", 0)
-                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{ts:.6f}"))
-                elif self._device_model == "2d_gauss":
-                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
-                    self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
-                    ts = p.get("timestamp_s", 0)
-                    self._data_table.setItem(row, 6, QTableWidgetItem(f"{ts:.6f}"))
-                elif self._device_model == "3d_gauss":
-                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_z_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 5, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
-                    self._data_table.setItem(row, 6, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
-                    ts = p.get("timestamp_s", 0)
-                    self._data_table.setItem(row, 7, QTableWidgetItem(f"{ts:.6f}"))
-                elif self._device_model == "3d_fluxgate":
-                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_x_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('field_y_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('field_z_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{p.get('field_total_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 5, QTableWidgetItem("—"))
-                    self._data_table.setItem(row, 6, QTableWidgetItem("—"))
-                    ts = p.get("timestamp_s", 0)
-                    self._data_table.setItem(row, 7, QTableWidgetItem(f"{ts:.6f}"))
-                else:
-                    self._data_table.setItem(row, 1, QTableWidgetItem(f"{p.get('field_mt', 0):.6f}"))
-                    self._data_table.setItem(row, 2, QTableWidgetItem(f"{p.get('freq_hz', 0):.1f}"))
-                    self._data_table.setItem(row, 3, QTableWidgetItem(f"{p.get('temp_c', 0):.1f}"))
-                    ts = p.get("timestamp_s", 0)
-                    self._data_table.setItem(row, 4, QTableWidgetItem(f"{ts:.6f}"))
-            self._data_table.scrollToBottom()
+                sequence = self._total_points - len(points) + i + 1
+                self._pending_live_table_rows.append(self._live_table_row_values(sequence, p))
+            max_pending = max(self._table_max_rows_spin.value() * 2, 1000)
+            if len(self._pending_live_table_rows) > max_pending:
+                self._pending_live_table_rows = self._pending_live_table_rows[-max_pending:]
 
         # CSV 记录 (使用 CH1600Recorder)
         if self._recorder and self._recorder.is_recording:
@@ -2267,6 +3200,41 @@ class GaussMeterGUI(QMainWindow):
             except Exception:
                 pass
 
+        # SQLite session store (query/review/provenance)
+        if self._db_store is not None and self._db_session_id is not None:
+            try:
+                first_seq = self._total_points - len(points) + 1
+                db_points = []
+                raw_frames = []
+                for i, p in enumerate(points):
+                    sequence = first_seq + i
+                    db_point = normalize_sample_by_capability(p, self._device_model)
+                    db_point["sequence"] = sequence
+                    db_point["device_model"] = self._device_model
+                    db_point["source"] = "realtime"
+                    db_point["field_unit"] = self._default_unit_for_model()
+                    db_points.append(db_point)
+                    raw_frame = p.get("_raw_frame")
+                    if raw_frame and self._cfg.get("database", {}).get("store_raw_frames", True):
+                        raw_frames.append({
+                            "sequence": sequence,
+                            "timestamp_s": p.get("timestamp_s", 0.0),
+                            "direction": "RX",
+                            "frame": raw_frame,
+                            "parsed_ok": True,
+                        })
+                self._db_store.append_samples(
+                    self._db_session_id,
+                    db_points,
+                    source="realtime",
+                    device_model=self._device_model,
+                    field_unit=self._default_unit_for_model(),
+                )
+                if raw_frames:
+                    self._db_store.append_raw_frames(self._db_session_id, raw_frames)
+            except Exception as exc:
+                self.log(f"[DB] 写入样本失败: {exc}")
+
         # 外部 IPC 广播
         if latest:
             self._ipc_service.publish_data(
@@ -2274,7 +3242,7 @@ class GaussMeterGUI(QMainWindow):
                 field_x_mt=latest.get("field_x_mt", 0.0),
                 field_y_mt=latest.get("field_y_mt", 0.0),
                 field_z_mt=latest.get("field_z_mt", 0.0),
-                field_total_mt=latest.get("field_mt", 0.0) or latest.get("field_total_mt", 0.0),
+                field_total_mt=latest.get("field_total_mt", latest.get("field_mt", 0.0)),
                 freq_hz=latest.get("freq_hz", 0.0),
                 temp_c=latest.get("temp_c", 0.0),
             )
@@ -2407,6 +3375,12 @@ class GaussMeterGUI(QMainWindow):
             self._cmd_service.stop()
         if self._recorder and self._recorder.is_recording:
             self._recorder.stop()
+        if self._db_store and self._db_session_id is not None:
+            try:
+                self._db_store.close_session(self._db_session_id)
+            except Exception:
+                pass
+            self._db_session_id = None
         self._ipc_service.stop()
         self._ipc_service.stop_namedpipe()
         # 保存 IPC 配置
@@ -2426,4 +3400,9 @@ class GaussMeterGUI(QMainWindow):
             save_config(self._cfg)
         except Exception:
             pass
+        if self._db_store:
+            try:
+                self._db_store.close()
+            except Exception:
+                pass
         super().closeEvent(event)

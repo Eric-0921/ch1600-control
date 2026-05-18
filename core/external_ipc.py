@@ -9,7 +9,12 @@ import json
 import threading
 from typing import Any, Callable, Dict, Optional
 
-import zmq
+try:
+    import zmq
+    _HAS_ZMQ = True
+except ImportError:
+    zmq = None  # type: ignore[assignment]
+    _HAS_ZMQ = False
 
 try:
     import win32pipe
@@ -54,11 +59,17 @@ class ExternalIPCService:
     def set_command_callbacks(self, callbacks: Dict[str, Callable]) -> None:
         self._callbacks = callbacks
 
+    @property
+    def zmq_available(self) -> bool:
+        return _HAS_ZMQ
+
     # ------------------------------------------------------------------
     # ZMQ
     # ------------------------------------------------------------------
 
     def start(self) -> None:
+        if not _HAS_ZMQ or zmq is None:
+            raise RuntimeError("pyzmq is not installed; ZMQ IPC is unavailable")
         if self._ctx is not None:
             return
         self._ctx = zmq.Context()
@@ -125,9 +136,9 @@ class ExternalIPCService:
                     msg = self._rep_socket.recv_string()
                     response = self._handle_command(msg)
                     self._rep_socket.send_string(response)
-            except zmq.ContextTerminated:
-                break
-            except Exception:
+            except Exception as exc:
+                if _HAS_ZMQ and zmq is not None and isinstance(exc, zmq.ContextTerminated):
+                    break
                 pass
 
     # ------------------------------------------------------------------
@@ -207,7 +218,7 @@ class ExternalIPCService:
             else:
                 return json.dumps({"status": "error", "message": "invalid command format"})
         except json.JSONDecodeError:
-            return json.dumps({"status": "error", "message": "invalid json"})
+            return self._handle_legacy_datareader2_command(msg)
 
         handler = self._callbacks.get(cmd_name)
         if handler is None:
@@ -224,3 +235,69 @@ class ExternalIPCService:
             return json.dumps(result)
         except Exception as exc:
             return json.dumps({"status": "error", "message": str(exc)})
+
+    def _handle_legacy_datareader2_command(self, msg: str) -> str:
+        """Handle DataReader2-style tab-delimited NamedPipe commands.
+
+        Reverse-engineered commands:
+          GD\t<count>\t<sample_mode>\t<save>  -> configure and start reading
+          SG                                  -> stop reading (sends DATAC> in DataReader2)
+          ST\t<port>\t<model>\t<mode>\t<unit>\t<save>\t<max>\t<strategy>\t<always>
+                                              -> configure only
+        m1600 keeps configuration in the GUI, so unsupported fields are echoed
+        back as parsed metadata instead of being silently applied.
+        """
+        parts = msg.strip().split("\t")
+        if not parts or not parts[0]:
+            return json.dumps({"status": "error", "message": "invalid json"})
+        command = parts[0].upper()
+        try:
+            if command == "GD":
+                if len(parts) != 4:
+                    return json.dumps({"status": "error", "message": "GD expects 4 tab-delimited fields"})
+                handler = self._callbacks.get("start_acquisition")
+                if handler is None:
+                    return json.dumps({"status": "error", "message": "start_acquisition callback not registered"})
+                result = handler()
+                if result is None:
+                    result = {}
+                if not isinstance(result, dict):
+                    result = {"result": result}
+                result.setdefault("status", "ok")
+                result["legacy_command"] = "GD"
+                result["requested_count"] = int(parts[1])
+                result["sample_mode_index"] = int(parts[2])
+                result["save_enabled"] = parts[3] != "0"
+                return json.dumps(result)
+            if command == "SG":
+                handler = self._callbacks.get("stop_acquisition")
+                if handler is None:
+                    return json.dumps({"status": "error", "message": "stop_acquisition callback not registered"})
+                result = handler()
+                if result is None:
+                    result = {}
+                if not isinstance(result, dict):
+                    result = {"result": result}
+                result.setdefault("status", "ok")
+                result["legacy_command"] = "SG"
+                return json.dumps(result)
+            if command == "ST":
+                if len(parts) != 9:
+                    return json.dumps({"status": "error", "message": "ST expects 9 tab-delimited fields"})
+                return json.dumps({
+                    "status": "ok",
+                    "legacy_command": "ST",
+                    "applied": False,
+                    "message": "configuration parsed but not applied; use JSON API or GUI settings",
+                    "port": f"COM{parts[1]}",
+                    "model_index": int(parts[2]),
+                    "sample_mode_index": int(parts[3]),
+                    "unit_index": int(parts[4]),
+                    "save_enabled": parts[5] != "0",
+                    "max_rows": int(parts[6]),
+                    "rollover_strategy_index": int(parts[7]),
+                    "always_reading": parts[8] == "1",
+                })
+            return json.dumps({"status": "error", "message": f"unknown legacy command: {command}"})
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc), "legacy_command": command})

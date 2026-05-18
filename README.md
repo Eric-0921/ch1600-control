@@ -14,8 +14,9 @@ A high-performance Python application for controlling and acquiring data from th
 - **Threshold alarm** — NG/OK real-time status with closed/open interval and ABS modes
 - **Real-time data table** — scrollable QTableWidget with configurable row limit (100–5000)
 - **CSV data recording** — batch-write with UTF-8 BOM encoding; auto file rollover by size or row count
+- **SQLite experiment sessions** — indexed sessions/samples/raw frames/exports for query and provenance
 - **Data export** — Excel (`.xlsx`, SimSun headers, auto-format protection) and tab-delimited TXT
-- **Data review** — load historical CSV/TXT files, multi-file merge, waveform playback with dual Y-axes
+- **Data review** — load CSV/TXT/SQLite data, filter by sequence/time/source, view 2D heatmaps and optional 3D surfaces, export selections and HTML reports
 - **Raw serial debug** — Hex/ASCII TX/RX monitor with manual command input and quick buttons
 - **External IPC** — ZMQ PUB/REP + Windows NamedPipe for third-party integration
 - **Chart customization** — curve colors, line width, history points, manual/auto Y-axis range
@@ -53,6 +54,9 @@ A high-performance Python application for controlling and acquiring data from th
 git clone https://github.com/YOUR_USERNAME/ch1600-control.git
 cd ch1600-control
 pip install -r requirements.txt
+
+# Optional ZMQ/NamedPipe integrations and 3D Surface preview
+pip install -r requirements-optional.txt
 ```
 
 ### Run
@@ -87,7 +91,11 @@ main.py                     # Entry point (QApplication + Fusion style)
 └── data/
     ├── circular_buffer.py  # Thread-safe ring buffer with downsampling
     ├── recorder.py         # CSV recorder with auto file rollover
-    └── review_loader.py    # Historical CSV/TXT loader + merge
+    ├── device_capabilities.py  # Device/probe capability matrix
+    ├── review_loader.py    # Historical CSV/TXT/SQLite review dataset helpers
+    ├── sqlite_store.py     # SQLite sessions/samples/raw frames/exports
+    ├── reporting.py        # HTML report exporter
+    └── spatial.py          # Heatmap/surface grid helpers for spatial scans
 ```
 
 **Signal flow:** `CH1600Driver → InstrumentController → CommandService → GUI`
@@ -141,12 +149,23 @@ Edit `config.json` to customize:
     "baudrate": 115200
   },
   "device_model": "1d_gauss",
+  "probe_profile": "standard_hall",
   "acquisition": {
     "save_dir": "./experiments",
     "mode_key": "dc_normal",
+    "threshold_channel": "field_total",
     "max_file_size_mb": 100,
     "max_file_rows": 100000,
     "rollover_strategy": "new_file"
+  },
+  "database": {
+    "path": "./experiments/m1600.sqlite3",
+    "enabled": true,
+    "store_raw_frames": true
+  },
+  "review": {
+    "default_source": "all",
+    "manual_axis_enabled": false
   },
   "ui": {
     "display_interval_ms": 30,
@@ -174,8 +193,23 @@ Edit `config.json` to customize:
 - **numpy** ≥ 1.24 — array operations
 - **pyqtgraph** ≥ 0.13 — real-time charting
 - **openpyxl** ≥ 3.0 — Excel export
-- **pyzmq** ≥ 25.0 — ZMQ IPC (optional)
-- **pywin32** — NamedPipe support on Windows (optional)
+
+Optional integrations:
+
+- **pyzmq** ≥ 25.0 — ZMQ IPC
+- **pywin32** — NamedPipe support on Windows
+- **PyOpenGL** ≥ 3.1 — optional 3D Surface preview in the Data Review page
+
+PyVista/VTK is not a base dependency. The 3D surface preview currently uses the
+lighter PyOpenGL backend through `app/surface_renderer.py`; PyVista can be
+evaluated later as an optional renderer for heavier mesh/volume workflows.
+
+## Development Checks
+
+```bash
+python -m compileall app core data instruments workers tests
+python -m unittest discover -v
+```
 
 ## Changelog
 
@@ -195,3 +229,4 @@ This project follows the architecture of [ODMR Control](https://github.com/...) 
 - [CH-1600 Command Reference](docs/CH-1600_commands_reference.md)
 - [Reverse Engineering Findings](docs/reverse_engineering_findings.md)
 - [Improvement Roadmap](docs/improvement_roadmap.md)
+- [Runtime Validation](docs/runtime_validation.md)

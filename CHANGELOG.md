@@ -2,6 +2,119 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased] — 2026-05-18
+
+Roadmap execution pass focused on turning px-1-inspired features into testable
+building blocks and documenting the remaining maturity gaps for follow-up
+agents.
+
+### Added
+
+- **SQLite experiment store** (`data/sqlite_store.py`)
+  - Added `sessions`, `samples`, `raw_frames`, and `exports` tables.
+  - Added session lifecycle, sample append/query, raw frame traceability, and export provenance APIs.
+  - GUI can load review data from SQLite by `session_id` and `source`.
+
+- **Unified review dataset** (`data/review_loader.py`)
+  - Normalizes m1600 CSV, DataReader2 tab-delimited TXT, and SQLite query results into one structured dtype.
+  - Supports mixed 1D/2D/3D schemas without dtype concat errors.
+  - Adds sequence/time/source/session filtering and selected-range CSV export.
+
+- **Review selection workflow** (`app/gui.py`)
+  - Added sequence range, relative time range, session/source filters.
+  - Added table selection and plot ROI linkage.
+  - Added manual X/Y axis presets and selected-range CSV export.
+
+- **HTML reporting** (`data/reporting.py`, `app/gui.py`)
+  - Added HTML report exporter with statistics and SVG curve.
+  - Added threshold evaluation summary.
+  - Added optional spatial heatmap SVG section when review data contains `x_mm/y_mm`.
+  - Added input file SHA256 metadata for reproducibility.
+  - Export records are stored in SQLite `exports` when the database is available.
+
+- **Spatial heatmap foundation** (`data/spatial.py`, `app/gui.py`)
+  - Added `build_heatmap_grid()` for `x_mm/y_mm` spatial scan data.
+  - Added NumPy-only IDW interpolation via `build_interpolated_heatmap_grid()`.
+  - Review page now has separate `Time` and `Heatmap` views to avoid confusing 3-axis time traces with spatial maps.
+  - Heatmap supports value-channel selection, raw/interpolated grids, automatic/manual levels, LUT color bar, contour overlay, and PNG export.
+
+- **Optional 3D Surface preview** (`data/spatial.py`, `app/gui.py`)
+  - Added `build_surface_grid()` as the data interface for spatial scalar-field surfaces.
+  - Review page now includes a `3D Surface` tab that reuses heatmap value channel, grid mode, resolution, and levels.
+  - 3D rendering uses optional `pyqtgraph.opengl`/`PyOpenGL`; missing OpenGL dependencies show a clear disabled state while the rest of the GUI keeps working.
+  - Added 3D PNG export and SQLite export provenance type `surface_3d_png`.
+
+- **GUI rendering/performance seam** (`app/gui.py`, `app/surface_renderer.py`)
+  - Added a small 3D surface renderer adapter around `pyqtgraph.opengl`, so a future PyVista/VTK backend can be evaluated without rewriting the review page.
+  - Review plots now refresh only the active `Time` / `Heatmap` / `3D Surface` tab, avoiding unnecessary heatmap interpolation or OpenGL work while another view is visible.
+  - Live data table updates are buffered and flushed every 150 ms instead of inserting rows inside the stream batch callback.
+
+- **Device/probe capability matrix** (`data/device_capabilities.py`)
+  - Added `DeviceCapability`, `ProbeProfile`, `get_device_capability()`, `get_probe_profile()`, and `normalize_sample_by_capability()`.
+  - Centralized 1D/2D/3D Gauss, Fluxmeter, 1D/3D Fluxgate units, channels, frequency/temperature support, recorder schema, table columns, and threshold channels.
+  - Added probe profiles for the documented HCHD801F standard Hall probe, weak-field probe, and custom/unknown probes.
+  - GUI now exposes probe profile metadata and uses the capability matrix for device model options, live table columns, display units, threshold channels, and buffer channels.
+
+- **Optional IPC dependencies**
+  - Moved `pyzmq` out of base `requirements.txt` into `requirements-optional.txt`.
+  - GUI disables ZMQ controls when `pyzmq` is unavailable instead of failing import.
+  - Added optional `PyOpenGL` for the review-page 3D Surface preview.
+
+- **Runtime validation record** (`docs/runtime_validation.md`)
+  - Installed optional dependencies on the target machine's active `py -3` Python environment: PyOpenGL 3.1.10, pyzmq 27.1.0, and pywin32 311.
+  - Recorded GUI/OpenGL validation artifacts under `experiments/runtime_validation/`.
+  - Captured that `conda` is not currently on PATH in this PowerShell session.
+
+- **DataReader2 legacy IPC compatibility** (`core/external_ipc.py`)
+  - JSON API still works.
+  - Added tab-delimited `GD`, `SG`, and `ST` command parsing.
+  - `SG` follows reverse-engineered DataReader2 behavior and stops acquisition.
+  - `ST` is parsed and echoed but does not silently mutate GUI state.
+
+- **Regression tests**
+  - Added standard unittest discovery entry.
+  - Added tests for fake serial framing, DataReader2 legacy IPC, GUI offscreen smoke, SQLite store, recorder rollover, review loader/reporting/spatial heatmap, and device capabilities.
+  - Current local baseline: `python -m unittest discover -v` runs 54 tests.
+
+### Changed
+
+- **Command framing** (`instruments/ch1600_driver.py`)
+  - `_send_command()` now accepts either command bodies or full `...>` protocol frames and appends `>`/`\r` consistently.
+  - Fixed `FASTxxx>`/`DATA?>` paths that could previously lose `>`.
+  - 1D gaussmeter 20 Hz still uses DataReader2's `FAST2>` shorthand.
+
+- **Panel streaming preview**
+  - Added `parse_first_stream_frame()` so connection probing splits CR/LF preview buffers and parses the first valid frame instead of treating multiple frames as one malformed line.
+
+- **Special prefix scaling**
+  - `HST/HSE` prefixes now normalize raw values by `×0.1`.
+  - `UHS` prefixes now normalize raw values by `×0.0001`.
+  - Special-prefix temperature remains raw Celsius, matching DataReader2 source behavior.
+
+- **2D long-frame compatibility**
+  - Parser accepts both two-segment `X/f/t;Y/f/t>` frames and DataReader2's suspicious three-segment `dg2[2]` Y-channel behavior.
+  - True segment meaning still needs real device samples.
+
+- **A/m conversion**
+  - GUI gaussmeter A/m conversion now uses `×795.77` because m1600 stores normalized mT internally.
+  - The apparent DataReader2 `79.577` branch is explained by `HST/HSE` raw values being 0.1 mT units before display conversion.
+
+- **3D Surface color handling**
+  - Flattened OpenGL vertex colors for pyqtgraph 0.14.0, fixing an `IndexError` seen during target-machine 2x2 surface export.
+
+- **Roadmap documentation**
+  - `docs/improvement_roadmap.md` now includes maturity semantics, incomplete work overview, changed-file handoff notes, and validation commands.
+  - `docs/reverse_engineering_findings.md` now includes a 2026-05-18 line-by-line difference matrix for DataReader2 vs Python behavior and manual-derived probe/dimension notes.
+
+### Known Gaps
+
+- No real CH-1600 hardware or logic-analyzer validation yet for FAST frame rates, special prefixes, or 2D three-segment long frames.
+- ZMQ/NamedPipe dependencies are installed locally, but no real Windows NamedPipe or external ZMQ client integration test has been run yet.
+- Review loader still runs on the GUI thread; large-file loading needs a worker.
+- 300 Hz realtime table is now throttled, but it still uses `QTableWidget`; a true `QAbstractTableModel`/virtual table remains the mature solution for long high-rate sessions.
+- 3D surface is now a v1 optional OpenGL preview and has passed target-machine smoke/export validation; real spatial scan samples, PyVista spike, PDF export, and print preview remain pending.
+- Fluxmeter/Fluxgate are unit-aware at UI/review/report layers, but some compatibility aliases still use `_mt` names.
+
 ## [Unreleased] — 2026-05-17
 
 Based on reverse-engineering findings from DataReader2.exe (ILSpy decompilation).
@@ -16,7 +129,7 @@ Based on reverse-engineering findings from DataReader2.exe (ILSpy decompilation)
 
 #### Unit Conversion Display
 - **GUI** (`app/gui.py`): Added 5-unit display matrix: **mT / G / Oe / A/m / mGs**.
-- Conversion coefficients match DataReader2 exactly (×1 / ×10 / ×10 / ×79.577 / ×10000).
+- Initial pass used DataReader2's special-prefix-looking A/m factor. This was corrected on 2026-05-18: normalized mT values use **×795.77** for A/m.
 - Display unit is independent from device unit; CSV always stores raw mT values.
 - User-selected display unit persisted in `config.json`.
 
@@ -149,7 +262,7 @@ Based on reverse-engineering findings from DataReader2.exe (ILSpy decompilation)
 #### 经验文档落地
 - **`docs/reverse_engineering_findings.md` 新增第 9 节**: “源码审查经验与隐藏细节”，记录：
   - 特殊前缀帧温度不 ÷10 的发现
-  - HSTDC/HSEDC/UHSDC 前缀帧的 field 值额外缩放（当前版本未实现缩放，留待硬件验证）
+  - HSTDC/HSEDC/UHSDC 前缀帧的 field 值额外缩放（2026-05-18 已实现默认缩放，仍需硬件验证）
   - 2D 长帧 `dg2[2]` 索引疑云（DataReader2 源码疑似 bug）
   - Fluxmeter `\0` 去除循环的无限循环风险
   - `#` 前缀检查的严格化决策

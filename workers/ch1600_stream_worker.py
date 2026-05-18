@@ -87,6 +87,7 @@ class CH1600StreamWorker(QObject):
                             )
                             if parsed is not None:
                                 parsed["timestamp_s"] = time.perf_counter()
+                                parsed["_raw_frame"] = line.decode("ascii", errors="replace")
                                 batch_points.append(parsed)
                                 latest_point = parsed
                                 self._point_count += 1

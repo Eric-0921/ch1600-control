@@ -1,0 +1,136 @@
+{
+  "qt_platform": "default",
+  "has_pyqtgraph_opengl": true,
+  "surface_widget_created": true,
+  "surface_item_created": true,
+  "surface_export_error": "",
+  "surface_status": "Raw 3D surface 2 × 2, value: field_total, range 1..4.24264; X/Y are centered for display.",
+  "heatmap_status": "原始 2 × 2 网格，4 个有效格，值: field_total，范围 1..4.24264",
+  "artifacts": {
+    "window_png": "experiments\\runtime_validation\\gui_window_validation.png",
+    "heatmap_png": "experiments\\runtime_validation\\gui_heatmap_validation.png",
+    "surface_png": "experiments\\runtime_validation\\gui_surface_validation.png",
+    "html_report": "experiments\\runtime_validation\\runtime_report_validation.html"
+  },
+  "models": {
+    "1d_gauss": {
+      "unit_options": [
+        "mT",
+        "G",
+        "Oe",
+        "A/m",
+        "mGs"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "磁场 / Field (mT)",
+        "频率 / Freq (Hz)",
+        "温度 / Temp (°C)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x"
+      ]
+    },
+    "2d_gauss": {
+      "unit_options": [
+        "mT",
+        "G",
+        "Oe",
+        "A/m",
+        "mGs"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "X (mT)",
+        "Y (mT)",
+        "Total B (mT)",
+        "频率 / Freq (Hz)",
+        "温度 / Temp (°C)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x",
+        "field_y"
+      ]
+    },
+    "3d_gauss": {
+      "unit_options": [
+        "mT",
+        "G",
+        "Oe",
+        "A/m",
+        "mGs"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "X (mT)",
+        "Y (mT)",
+        "Z (mT)",
+        "Total B (mT)",
+        "频率 / Freq (Hz)",
+        "温度 / Temp (°C)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x",
+        "field_y",
+        "field_z"
+      ]
+    },
+    "fluxmeter": {
+      "unit_options": [
+        "mWb"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "磁通 / Flux (mWb)",
+        "频率 / Freq (Hz)",
+        "温度 / Temp (°C)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x"
+      ]
+    },
+    "1d_fluxgate": {
+      "unit_options": [
+        "nT"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "磁场 / Field (nT)",
+        "频率 / Freq (Hz)",
+        "温度 / Temp (°C)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x"
+      ]
+    },
+    "3d_fluxgate": {
+      "unit_options": [
+        "nT"
+      ],
+      "table_columns": [
+        "序号 / #",
+        "X (nT)",
+        "Y (nT)",
+        "Z (nT)",
+        "Total B (nT)",
+        "时间戳 / Timestamp"
+      ],
+      "threshold_channels": [
+        "field_total",
+        "field_x",
+        "field_y",
+        "field_z"
+      ]
+    }
+  }
+}

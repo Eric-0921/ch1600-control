@@ -10,20 +10,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import datetime
 
-
-# 模型 -> 输出列定义 (ordered)
-_RECORDER_SCHEMA: Dict[str, List[str]] = {
-    "1d_gauss":     ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
-    "2d_gauss":     ["timestamp_s", "field_x_mt", "field_y_mt", "field_total_mt", "freq_hz", "temp_c"],
-    "3d_gauss":     ["timestamp_s", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt", "freq_hz", "temp_c"],
-    "fluxmeter":    ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
-    "1d_fluxgate":  ["timestamp_s", "field_total_mt", "freq_hz", "temp_c"],
-    "3d_fluxgate":  ["timestamp_s", "field_x_mt", "field_y_mt", "field_z_mt", "field_total_mt"],
-}
+from data.device_capabilities import get_device_capability
 
 
 def _get_schema(model: str) -> List[str]:
-    return _RECORDER_SCHEMA.get(model, _RECORDER_SCHEMA["1d_gauss"])
+    return list(get_device_capability(model).recorder_fields)
 
 
 class CH1600Recorder:

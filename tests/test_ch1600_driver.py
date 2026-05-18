@@ -5,6 +5,7 @@
 
 import math
 import unittest
+from unittest.mock import patch
 
 import sys
 from pathlib import Path
@@ -49,7 +50,7 @@ class TestParse1DGauss(unittest.TestCase):
         line = b"HSTDC:/1234.5/50/25>\n"
         result = CH1600Driver.parse_stream_frame(line, model="1d_gauss")
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result["field_x_mt"], 1234.5, places=6)
+        self.assertAlmostEqual(result["field_x_mt"], 123.45, places=6)
         self.assertAlmostEqual(result["freq_hz"], 50.0, places=1)
         self.assertAlmostEqual(result["temp_c"], 25.0, places=2)  # raw, no ÷10
 
@@ -58,7 +59,7 @@ class TestParse1DGauss(unittest.TestCase):
         line = b"UHSDC:/999.9/60/30>\n"
         result = CH1600Driver.parse_stream_frame(line, model="1d_gauss")
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result["field_x_mt"], 999.9, places=6)
+        self.assertAlmostEqual(result["field_x_mt"], 0.09999, places=6)
         self.assertAlmostEqual(result["temp_c"], 30.0, places=2)  # raw
 
     def test_invalid_no_hash(self):
@@ -98,6 +99,15 @@ class TestParse2DGauss(unittest.TestCase):
         self.assertAlmostEqual(result["field_y_mt"], 5678.901234, places=6)
         self.assertAlmostEqual(result["freq_hz"], 500.0, places=1)
         self.assertAlmostEqual(result["temp_c"], 2345.6, places=2)
+
+    def test_long_frame_with_datareader2_third_segment(self):
+        """兼容 DataReader2 反编译源码里的 dg2[2] 长帧索引。"""
+        line = b"#1234.567890/500/+023456;0.000000/000/+000000;5678.901234/600/+025678>\n"
+        result = CH1600Driver.parse_stream_frame(line, model="2d_gauss")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["field_x_mt"], 1234.567890, places=6)
+        self.assertAlmostEqual(result["field_y_mt"], 5678.901234, places=6)
+        self.assertAlmostEqual(result["freq_hz"], 500.0, places=1)
 
     def test_negative_components(self):
         """负值分量"""
@@ -295,6 +305,73 @@ class TestEdgeCases(unittest.TestCase):
         result = CH1600Driver.parse_stream_frame(line, model="unknown_model")
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result["field_x_mt"], 123.45, places=6)
+
+    def test_parse_first_stream_frame_splits_panel_preview(self):
+        preview = b"not-a-frame\r\n#1.0/0/+250>\n#2.0/0/+260>\n"
+        result = CH1600Driver.parse_first_stream_frame(preview, model="1d_gauss")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["field_total_mt"], 1.0, places=6)
+        self.assertAlmostEqual(result["temp_c"], 25.0, places=6)
+
+
+class FakeSerial:
+    def __init__(self, response: bytes = b"") -> None:
+        self.is_open = True
+        self.writes = []
+        self._buffer = response
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._buffer)
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    def read(self, n: int) -> bytes:
+        data = self._buffer[:n]
+        self._buffer = self._buffer[n:]
+        return data
+
+
+class TestCommandFraming(unittest.TestCase):
+    def _driver_with_fake_serial(self, response: bytes = b""):
+        driver = CH1600Driver()
+        fake = FakeSerial(response=response)
+        driver._serial = fake
+        driver._panel_streaming_mode = False
+        return driver, fake
+
+    def test_send_command_adds_protocol_terminator(self):
+        driver, fake = self._driver_with_fake_serial(b"mT\n")
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            result = driver._send_command("UNIT?")
+        self.assertEqual(result, b"mT\n")
+        self.assertEqual(fake.writes[-1], b"UNIT?>\r")
+
+    def test_send_command_does_not_duplicate_terminator(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver._send_command("DATA?>")
+        self.assertEqual(fake.writes[-1], b"DATA?>\r")
+
+    def test_start_streaming_uses_1d_fast2_shorthand(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.start_streaming(mode_key="dc_20hz", model="1d_gauss")
+        self.assertEqual(fake.writes[-1], b"FAST2>\r")
+        self.assertTrue(driver.is_streaming)
+
+    def test_start_streaming_preserves_fast_command_suffix(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.start_streaming(mode_key="dc_100hz", model="2d_gauss")
+        self.assertEqual(fake.writes[-1], b"FAST100>\r")
+
+    def test_threshold_command_is_framed(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.set_up_threshold(-1.23)
+        self.assertEqual(fake.writes[-1], b"UPTHRES-1.23>\r")
 
 
 if __name__ == "__main__":

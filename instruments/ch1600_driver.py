@@ -20,6 +20,8 @@ import threading
 import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from data.device_capabilities import DEVICE_CAPABILITIES
+
 try:
     import serial
 except ImportError:
@@ -40,56 +42,28 @@ class CH1600Driver:
         "HSEDC:", "HSEACL:", "HSEACH:",
         "UHSDC:", "UHSACL:", "UHSACH:",
     )
+    _SPECIAL_PREFIX_SCALE_MT = {
+        "HSTDC:": 0.1,
+        "HSTACL:": 0.1,
+        "HSTACH:": 0.1,
+        "HSEDC:": 0.1,
+        "HSEACL:": 0.1,
+        "HSEACH:": 0.1,
+        "UHSDC:": 0.0001,
+        "UHSACL:": 0.0001,
+        "UHSACH:": 0.0001,
+    }
 
     DEVICE_MODEL_TABLE: Dict[str, Dict[str, Any]] = {
-        "1d_gauss": {
-            "label": "一维高斯计 / 1D Gauss Meter",
-            "dimension": 1,
-            "has_freq": True,
-            "has_temp": True,
-            "unit": "mT",
-            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
-        },
-        "2d_gauss": {
-            "label": "二维高斯计 / 2D Gauss Meter",
-            "dimension": 2,
-            "has_freq": True,
-            "has_temp": True,
-            "unit": "mT",
-            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
-        },
-        "3d_gauss": {
-            "label": "三维高斯计 / 3D Gauss Meter",
-            "dimension": 3,
-            "has_freq": True,
-            "has_temp": True,
-            "unit": "mT",
-            "available_units": ["mT", "G", "Oe", "A/m", "mGs"],
-        },
-        "fluxmeter": {
-            "label": "磁通计 / Fluxmeter",
-            "dimension": 1,
-            "has_freq": True,
-            "has_temp": True,
-            "unit": "mWb",
-            "available_units": ["mWb"],
-        },
-        "1d_fluxgate": {
-            "label": "一维磁通门计 / 1D Fluxgate",
-            "dimension": 1,
-            "has_freq": True,
-            "has_temp": True,
-            "unit": "nT",
-            "available_units": ["nT"],
-        },
-        "3d_fluxgate": {
-            "label": "三维磁通门计 / 3D Fluxgate",
-            "dimension": 3,
-            "has_freq": False,
-            "has_temp": False,
-            "unit": "nT",
-            "available_units": ["nT"],
-        },
+        key: {
+            "label": cap.label,
+            "dimension": cap.measurement_dimension,
+            "has_freq": cap.has_freq,
+            "has_temp": cap.has_temp,
+            "unit": cap.field_unit,
+            "available_units": list(cap.available_units),
+        }
+        for key, cap in DEVICE_CAPABILITIES.items()
     }
 
     def __init__(self) -> None:
@@ -203,7 +177,7 @@ class CH1600Driver:
         preview = self._read_available()
         if preview:
             # 检查是否是数据帧 (面板实时发送模式)
-            frame = CH1600Driver.parse_stream_frame(preview)
+            frame = CH1600Driver.parse_first_stream_frame(preview)
             if frame is not None:
                 self._panel_streaming_mode = True
                 self._cached_field_mt = frame["field_mt"]
@@ -321,7 +295,12 @@ class CH1600Driver:
         with self._lock:
             if self._serial is None or not self._serial.is_open:
                 raise ConnectionError("CH-1600 未连接")
-            tx = (cmd + "\r").encode("ascii")
+            clean_cmd = cmd.strip()
+            if not clean_cmd:
+                raise ValueError("empty CH-1600 command")
+            if not clean_cmd.endswith(">"):
+                clean_cmd += ">"
+            tx = (clean_cmd + "\r").encode("ascii")
             self._serial.write(tx)
             if self._raw_log_cb:
                 try:
@@ -395,6 +374,22 @@ class CH1600Driver:
             return CH1600Driver._parse_1d_gauss(text, length)
 
     @staticmethod
+    def parse_first_stream_frame(data: bytes, model: str = "1d_gauss") -> Optional[Dict[str, float]]:
+        """Parse the first valid frame from a serial preview buffer.
+
+        DataReader2 splits ``ReadExisting()`` chunks on CR/LF before analysis.
+        Doing the same here avoids treating multiple already-buffered panel
+        frames as one malformed frame during connection probing.
+        """
+        for line in data.replace(b"\r", b"\n").split(b"\n"):
+            if not line.strip():
+                continue
+            parsed = CH1600Driver.parse_stream_frame(line, model=model)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
     def _parse_1d_gauss(text: str, length: int) -> Optional[Dict[str, float]]:
         try:
             for prefix in CH1600Driver.SPECIAL_PREFIXES:
@@ -402,7 +397,11 @@ class CH1600Driver:
                     parts = text.split("/")
                     if len(parts) < 4:
                         return None
-                    field_x = float(parts[1])
+                    # DataReader2 applies GuassUnit-dependent scaling to these
+                    # undocumented prefixes. m1600 stores base values as mT, so
+                    # use the GuassUnit==0 branch: HST/HSE raw units are 0.1 mT,
+                    # UHS raw units are 0.0001 mT. Temperature is already raw °C.
+                    field_x = float(parts[1]) * CH1600Driver._SPECIAL_PREFIX_SCALE_MT[prefix]
                     freq = float(parts[2])
                     temp = float(parts[3].rstrip(">"))
                     return {
@@ -452,11 +451,14 @@ class CH1600Driver:
                 temp = 0.0
             else:
                 # 长帧: #X/频率/温度;Y/频率/温度>
+                # DataReader2 decompiled code uses dg2[2] for Y, which implies
+                # some batches may emit a third segment. Prefer that when
+                # present, but keep the documented two-segment shape working.
                 dg2 = core.split(";")
                 if len(dg2) < 2:
                     return None
                 x_parts = dg2[0].split("/")
-                y_parts = dg2[1].split("/")
+                y_parts = (dg2[2] if len(dg2) >= 3 else dg2[1]).split("/")
                 if len(x_parts) < 3 or len(y_parts) < 1:
                     return None
                 field_x = float(x_parts[0])
@@ -618,8 +620,7 @@ class CH1600Driver:
         # 一维高斯计 20Hz 快速模式使用简写 FAST2>
         if model == "1d_gauss" and cmd == "FAST020>":
             cmd = mode_cfg.get("fast_1d_command", "FAST2>")
-        # 去掉末尾的 >，_send_command 会自动追加 \r
-        self._send_command(cmd.rstrip(">"))
+        self._send_command(cmd)
 
         # 排空启动时的残留缓冲数据，需在锁内访问 _serial
         with self._lock:
@@ -641,7 +642,7 @@ class CH1600Driver:
         """
         from app.config_io import ACQ_MODE_TABLE
         cmd = ACQ_MODE_TABLE.get(mode_key, {}).get("start_command", "DATA?>")
-        self._send_command(cmd.rstrip(">"))
+        self._send_command(cmd)
         return cmd
 
     def stop_streaming(self) -> None:
