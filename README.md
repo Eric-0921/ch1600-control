@@ -26,20 +26,10 @@ A high-performance Python application for controlling and acquiring data from th
 
 ## Screenshots
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ [● conn] [● stream] [○ rec]  mT | Auto  FPS: 33.2  12580 pts │
-├──────────┬───────────────────────────────────────────────┤
-│ 连接     │  ┌─────────────────────────────────────────┐  │
-│ 参数     │  │  磁场: -12345.6789 mT                    │  │
-│ 实时数据 │  │  频率: 50 Hz    温度: 23.4 °C            │  │
-│ 数据回看 │  │  ┌─────────────────────────────────────┐│  │
-│ 调试     │  │  │    ╱╲    ╱╲   ← 磁场波形 33 FPS     ││  │
-│ 日志     │  │  │───╱────╲╱────╲───────────────────  ││  │
-│          │  │  └─────────────────────────────────────┘│  │
-│          │  └─────────────────────────────────────────┘  │
-└──────────┴───────────────────────────────────────────────┘
-```
+![CH-1600 release poster](docs/images/ch1600_release_poster.jpg)
+
+Additional UI captures are available in [docs/images](docs/images/), including live chart,
+live table, review time curve, heatmap, 3D surface, and review table validation views.
 
 ## Quick Start
 
