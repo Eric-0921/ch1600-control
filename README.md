@@ -82,6 +82,12 @@ python -m pip install -r requirements-optional.txt
 python main.py
 ```
 
+Launch with built-in demo review data for chart validation:
+
+```bash
+python main.py --demo-review
+```
+
 For automated GUI checks on headless/offscreen environments:
 
 ```bash

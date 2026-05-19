@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import QApplication
 
 from app.config_io import DEFAULT_CONFIG
 from app.gui import GaussMeterGUI, _HAS_PYG, _HAS_PYG_GL
+from main import build_demo_review_data
 from data.review_loader import records_to_review_array
 
 
@@ -62,6 +63,16 @@ class _FakeCommandService:
 
 
 class TestGUISmoke(unittest.TestCase):
+    def test_demo_review_data_covers_spatial_review_views(self):
+        data = build_demo_review_data()
+        self.assertEqual(len(data), 252)
+        for name in ("timestamp_s", "x_mm", "y_mm", "field_total", "freq_hz", "temp_c"):
+            self.assertIn(name, data.dtype.names)
+            self.assertTrue(np.isfinite(data[name]).all())
+        self.assertEqual(len(np.unique(data["x_mm"])), 18)
+        self.assertEqual(len(np.unique(data["y_mm"])), 14)
+        self.assertGreater(float(np.ptp(data["field_total"])), 0.5)
+
     def test_gui_instantiates_without_zmq_or_config_mutation(self):
         app = QApplication.instance() or QApplication([])
         cfg = copy.deepcopy(DEFAULT_CONFIG)

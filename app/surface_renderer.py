@@ -8,6 +8,7 @@ surface/update/export methods without rewriting the review page.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -15,7 +16,7 @@ import numpy as np
 
 try:
     import pyqtgraph.opengl as gl
-    _HAS_PYG_GL = True
+    _HAS_PYG_GL = os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
 except Exception:
     gl = None
     _HAS_PYG_GL = False
@@ -107,4 +108,3 @@ class PyQtGraphSurfaceRenderer:
 
 
 SurfaceRenderer = PyQtGraphSurfaceRenderer
-
