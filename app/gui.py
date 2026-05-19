@@ -22,7 +22,7 @@ from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMenuBar, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QTreeWidget, QTreeWidgetItem,
@@ -915,6 +915,24 @@ class GaussMeterGUI(QMainWindow):
         ctrl_status_row.addWidget(self._live_stats)
         layout.addLayout(ctrl_status_row)
 
+        self._live_tabs = QTabWidget()
+        chart_page = QWidget()
+        chart_layout = QVBoxLayout(chart_page)
+        chart_layout.setContentsMargins(8, 8, 8, 8)
+        chart_layout.setSpacing(8)
+        table_page = QWidget()
+        table_layout = QVBoxLayout(table_page)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        table_layout.setSpacing(8)
+        recording_page = QWidget()
+        recording_layout = QVBoxLayout(recording_page)
+        recording_layout.setContentsMargins(8, 8, 8, 8)
+        recording_layout.setSpacing(8)
+        self._live_tabs.addTab(chart_page, "波形 / Chart")
+        self._live_tabs.addTab(table_page, "实时表格 / Table")
+        self._live_tabs.addTab(recording_page, "数据记录 / Recording")
+        layout.addWidget(self._live_tabs)
+
         # pyqtgraph 图表
         if _HAS_PYG:
             self._plot_widget = pg.PlotWidget()
@@ -922,7 +940,7 @@ class GaussMeterGUI(QMainWindow):
             self._plot_widget.setLabel("bottom", "时间", units="s")
             self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
             self._plot_widget.addLegend()
-            self._plot_widget.setMinimumHeight(260)
+            self._plot_widget.setMinimumHeight(360)
 
             # 性能优化
             self._plot_widget.setClipToView(True)
@@ -959,12 +977,12 @@ class GaussMeterGUI(QMainWindow):
             )
             self._plot_widget.addItem(self._zero_line)
 
-            layout.addWidget(self._plot_widget)
+            chart_layout.addWidget(self._plot_widget)
         else:
             self._plot_widget = None
             no_plot = QLabel("pyqtgraph 未安装, 图表不可用 / pyqtgraph not installed")
             no_plot.setAlignment(Qt.AlignCenter)
-            layout.addWidget(no_plot)
+            chart_layout.addWidget(no_plot)
 
         # 复选框行
         chk_row = QHBoxLayout()
@@ -972,7 +990,7 @@ class GaussMeterGUI(QMainWindow):
         self._show_freq_cb.toggled.connect(self._on_toggle_freq_curve)
         chk_row.addWidget(self._show_freq_cb)
         chk_row.addStretch()
-        layout.addLayout(chk_row)
+        chart_layout.addLayout(chk_row)
 
         # 图表配置区
         chart_cfg_grp = QGroupBox("图表配置 / Chart Config")
@@ -1038,7 +1056,7 @@ class GaussMeterGUI(QMainWindow):
         save_cfg_btn.clicked.connect(self._on_save_chart_config)
         cfg_g.addWidget(save_cfg_btn, 4, 0, 1, 2, alignment=Qt.AlignLeft)
 
-        layout.addWidget(chart_cfg_grp)
+        chart_layout.addWidget(chart_cfg_grp)
 
         # 图表控制按钮行 (清除 / 暂停 / 保存)
         chart_btn_row = QHBoxLayout()
@@ -1057,12 +1075,10 @@ class GaussMeterGUI(QMainWindow):
         chart_btn_row.addWidget(save_chart_btn)
 
         chart_btn_row.addStretch()
-        layout.addLayout(chart_btn_row)
+        chart_layout.addLayout(chart_btn_row)
 
         # ── 实时数据表格 ──
         table_grp = QGroupBox("实时数据表格 / Live Data Table")
-        table_grp.setCheckable(True)
-        table_grp.setChecked(False)
         tv = QVBoxLayout(table_grp)
 
         self._data_table = QTableWidget()
@@ -1070,7 +1086,10 @@ class GaussMeterGUI(QMainWindow):
         self._data_table.setColumnCount(len(columns))
         self._data_table.setHorizontalHeaderLabels(columns)
         self._data_table.horizontalHeader().setStretchLastSection(True)
-        self._data_table.setMaximumHeight(200)
+        self._data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._data_table.setMinimumHeight(360)
+        self._data_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._data_table.setAlternatingRowColors(True)
         tv.addWidget(self._data_table)
 
@@ -1089,12 +1108,11 @@ class GaussMeterGUI(QMainWindow):
         table_ctrl.addStretch()
         tv.addLayout(table_ctrl)
 
-        layout.addWidget(table_grp)
+        table_layout.addWidget(table_grp)
+        table_layout.addStretch()
 
         # ── 数据记录组 (可折叠) ──
         rec_grp = QGroupBox("数据记录 / Recording")
-        rec_grp.setCheckable(True)
-        rec_grp.setChecked(False)
         rv = QVBoxLayout(rec_grp)
 
         # 保存目录选择
@@ -1171,7 +1189,8 @@ class GaussMeterGUI(QMainWindow):
         self._rec_stats_label = QLabel("未记录 / Not Recording")
         rv.addWidget(self._rec_stats_label)
 
-        layout.addWidget(rec_grp)
+        recording_layout.addWidget(rec_grp)
+        recording_layout.addStretch()
 
         return page
 
@@ -1187,6 +1206,29 @@ class GaussMeterGUI(QMainWindow):
         title = QLabel("数据回看 / Data Review")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
+
+        self._review_main_tabs = QTabWidget()
+        source_page = QWidget()
+        source_tab_layout = QVBoxLayout(source_page)
+        source_tab_layout.setContentsMargins(8, 8, 8, 8)
+        source_tab_layout.setSpacing(8)
+        filter_page = QWidget()
+        filter_tab_layout = QVBoxLayout(filter_page)
+        filter_tab_layout.setContentsMargins(8, 8, 8, 8)
+        filter_tab_layout.setSpacing(8)
+        plot_page = QWidget()
+        plot_tab_layout = QVBoxLayout(plot_page)
+        plot_tab_layout.setContentsMargins(8, 8, 8, 8)
+        plot_tab_layout.setSpacing(8)
+        table_page = QWidget()
+        table_tab_layout = QVBoxLayout(table_page)
+        table_tab_layout.setContentsMargins(8, 8, 8, 8)
+        table_tab_layout.setSpacing(8)
+        self._review_main_tabs.addTab(source_page, "数据源 / Source")
+        self._review_main_tabs.addTab(filter_page, "筛选统计 / Filter && Stats")
+        self._review_main_tabs.addTab(plot_page, "图表 / Plots")
+        self._review_main_tabs.addTab(table_page, "数据表 / Table")
+        layout.addWidget(self._review_main_tabs, 1)
 
         # 文件选择区
         file_grp = QGroupBox("文件选择 / File Selection")
@@ -1208,7 +1250,7 @@ class GaussMeterGUI(QMainWindow):
         self._review_clear_btn.clicked.connect(self._on_clear_review)
         file_layout.addWidget(self._review_clear_btn)
 
-        layout.addWidget(file_grp)
+        source_tab_layout.addWidget(file_grp)
 
         # 数据库查询区
         db_grp = QGroupBox("数据库查询 / SQLite Query")
@@ -1231,11 +1273,14 @@ class GaussMeterGUI(QMainWindow):
         self._review_load_db_btn.clicked.connect(self._on_load_review_from_database)
         db_layout.addWidget(self._review_load_db_btn)
         db_layout.addStretch()
-        layout.addWidget(db_grp)
+        source_tab_layout.addWidget(db_grp)
+        source_tab_layout.addStretch()
 
         # 选区与坐标控制
-        filter_grp = QGroupBox("节选与坐标 / Selection & Axes")
-        filter_layout = QGridLayout(filter_grp)
+        filter_grp = QGroupBox("筛选与坐标 / Filters && Axes")
+        filter_grid = QGridLayout(filter_grp)
+        filter_grid.setHorizontalSpacing(12)
+        filter_grid.setVerticalSpacing(8)
 
         self._review_seq_start_spin = QSpinBox()
         self._review_seq_start_spin.setRange(0, 2_000_000_000)
@@ -1245,24 +1290,26 @@ class GaussMeterGUI(QMainWindow):
         self._review_seq_end_spin.setToolTip("0 表示不限制截止序号")
         self._review_time_start_edit = QLineEdit()
         self._review_time_start_edit.setPlaceholderText("相对秒，可空")
-        self._review_time_start_edit.setFixedWidth(90)
+        self._review_time_start_edit.setMinimumWidth(150)
         self._review_time_end_edit = QLineEdit()
         self._review_time_end_edit.setPlaceholderText("相对秒，可空")
-        self._review_time_end_edit.setFixedWidth(90)
+        self._review_time_end_edit.setMinimumWidth(150)
 
-        filter_layout.addWidget(QLabel("序号 / Seq:"), 0, 0)
-        filter_layout.addWidget(self._review_seq_start_spin, 0, 1)
-        filter_layout.addWidget(QLabel("到 / To"), 0, 2)
-        filter_layout.addWidget(self._review_seq_end_spin, 0, 3)
-        filter_layout.addWidget(QLabel("时间 / Time:"), 0, 4)
-        filter_layout.addWidget(self._review_time_start_edit, 0, 5)
-        filter_layout.addWidget(QLabel("到 / To"), 0, 6)
-        filter_layout.addWidget(self._review_time_end_edit, 0, 7)
+        filter_grid.addWidget(QLabel("起始序号 / Seq From:"), 0, 0)
+        filter_grid.addWidget(self._review_seq_start_spin, 0, 1)
+        filter_grid.addWidget(QLabel("截止序号 / Seq To:"), 0, 2)
+        filter_grid.addWidget(self._review_seq_end_spin, 0, 3)
+        filter_grid.addWidget(QLabel("起始时间 / Time From:"), 1, 0)
+        filter_grid.addWidget(self._review_time_start_edit, 1, 1)
+        filter_grid.addWidget(QLabel("截止时间 / Time To:"), 1, 2)
+        filter_grid.addWidget(self._review_time_end_edit, 1, 3)
 
-        self._review_apply_filter_btn = QPushButton("应用选区 / Apply")
+        self._review_apply_filter_btn = QPushButton("应用筛选 / Apply Filter")
+        self._review_apply_filter_btn.setToolTip("按当前序号和时间范围筛选数据，并刷新图表、统计和表格")
         self._review_apply_filter_btn.clicked.connect(self._apply_review_filter)
 
-        self._review_reset_filter_btn = QPushButton("重置 / Reset")
+        self._review_reset_filter_btn = QPushButton("重置筛选 / Reset Filter")
+        self._review_reset_filter_btn.setToolTip("清空筛选条件，恢复显示完整数据集")
         self._review_reset_filter_btn.clicked.connect(self._reset_review_filter_controls)
 
         self._review_auto_axis_cb = QCheckBox("自动坐标 / Auto Axes")
@@ -1270,33 +1317,36 @@ class GaussMeterGUI(QMainWindow):
             not self._cfg.get("review", {}).get("manual_axis_enabled", False)
         )
         self._review_auto_axis_cb.toggled.connect(self._update_review_plot)
-        filter_layout.addWidget(self._review_auto_axis_cb, 1, 0, 1, 2)
+        filter_grid.addWidget(self._review_auto_axis_cb, 2, 0, 1, 2)
 
         self._review_x_min_edit = QLineEdit(str(self._cfg.get("review", {}).get("x_min_s", 0.0)))
-        self._review_x_min_edit.setFixedWidth(80)
+        self._review_x_min_edit.setMinimumWidth(110)
         self._review_x_max_edit = QLineEdit(str(self._cfg.get("review", {}).get("x_max_s", 60.0)))
-        self._review_x_max_edit.setFixedWidth(80)
+        self._review_x_max_edit.setMinimumWidth(110)
         self._review_y_min_edit = QLineEdit(str(self._cfg.get("review", {}).get("y_min", -1.0)))
-        self._review_y_min_edit.setFixedWidth(80)
+        self._review_y_min_edit.setMinimumWidth(110)
         self._review_y_max_edit = QLineEdit(str(self._cfg.get("review", {}).get("y_max", 1.0)))
-        self._review_y_max_edit.setFixedWidth(80)
+        self._review_y_max_edit.setMinimumWidth(110)
         for edit in (self._review_x_min_edit, self._review_x_max_edit, self._review_y_min_edit, self._review_y_max_edit):
             edit.editingFinished.connect(self._update_review_plot)
 
-        filter_layout.addWidget(QLabel("X min/max:"), 1, 2)
-        filter_layout.addWidget(self._review_x_min_edit, 1, 3)
-        filter_layout.addWidget(self._review_x_max_edit, 1, 4)
-        filter_layout.addWidget(QLabel("Y min/max:"), 1, 5)
-        filter_layout.addWidget(self._review_y_min_edit, 1, 6)
-        filter_layout.addWidget(self._review_y_max_edit, 1, 7)
+        filter_grid.addWidget(QLabel("X 范围 / X Range:"), 2, 2)
+        filter_grid.addWidget(self._review_x_min_edit, 2, 3)
+        filter_grid.addWidget(self._review_x_max_edit, 2, 4)
+        filter_grid.addWidget(QLabel("Y 范围 / Y Range:"), 3, 2)
+        filter_grid.addWidget(self._review_y_min_edit, 3, 3)
+        filter_grid.addWidget(self._review_y_max_edit, 3, 4)
 
-        save_view_btn = QPushButton("保存视图 / Save View")
+        save_view_btn = QPushButton("保存坐标 / Save Axes")
+        save_view_btn.setToolTip("保存当前手动 X/Y 坐标范围到配置，下次启动继续使用")
         save_view_btn.clicked.connect(self._save_review_view_preset)
 
         export_sel_btn = QPushButton("导出选区 CSV / Export Selection")
+        export_sel_btn.setToolTip("导出当前筛选后的回看数据到 CSV 文件")
         export_sel_btn.clicked.connect(self._on_export_review_selection)
 
         report_btn = QPushButton("HTML 报告 / HTML Report")
+        report_btn.setToolTip("基于当前筛选后的回看数据生成 HTML 报告")
         report_btn.clicked.connect(self._on_export_review_report)
 
         filter_actions = QHBoxLayout()
@@ -1307,22 +1357,35 @@ class GaussMeterGUI(QMainWindow):
             export_sel_btn,
             report_btn,
         ):
-            btn.setMinimumWidth(120)
+            btn.setMinimumWidth(145)
             filter_actions.addWidget(btn)
         filter_actions.addStretch()
-        filter_layout.addLayout(filter_actions, 2, 0, 1, 8)
+        filter_grid.addLayout(filter_actions, 4, 0, 1, 5)
+        for col in (1, 3, 4):
+            filter_grid.setColumnStretch(col, 1)
 
-        layout.addWidget(filter_grp)
+        filter_tab_layout.addWidget(filter_grp)
 
         # 统计信息区
         stats_grp = QGroupBox("统计信息 / Statistics")
         stats_layout = QGridLayout(stats_grp)
+        stats_layout.setHorizontalSpacing(16)
+        stats_layout.setVerticalSpacing(8)
 
         self._review_stat_count = QLabel("--")
         self._review_stat_duration = QLabel("--")
         self._review_stat_min = QLabel("--")
         self._review_stat_max = QLabel("--")
         self._review_stat_mean = QLabel("--")
+        for value_label in (
+            self._review_stat_count,
+            self._review_stat_duration,
+            self._review_stat_min,
+            self._review_stat_max,
+            self._review_stat_mean,
+        ):
+            value_label.setMinimumWidth(160)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         stats_layout.addWidget(QLabel("数据点数 / Count:"), 0, 0)
         stats_layout.addWidget(self._review_stat_count, 0, 1)
@@ -1344,11 +1407,13 @@ class GaussMeterGUI(QMainWindow):
 
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
-        layout.addWidget(stats_grp)
+        filter_tab_layout.addWidget(stats_grp)
+        filter_tab_layout.addStretch()
 
         # 图表区
         if _HAS_PYG:
             self._review_plot_tabs = QTabWidget()
+            self._review_plot_tabs.setMinimumHeight(460)
             time_plot_page = QWidget()
             time_plot_layout = QVBoxLayout(time_plot_page)
             time_plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -1357,7 +1422,7 @@ class GaussMeterGUI(QMainWindow):
             self._review_plot_widget.setLabel("left", "磁场", units="mT")
             self._review_plot_widget.setLabel("bottom", "时间", units="s")
             self._review_plot_widget.showGrid(x=True, y=True, alpha=0.3)
-            self._review_plot_widget.setMinimumHeight(300)
+            self._review_plot_widget.setMinimumHeight(420)
 
             self._review_field_curve = self._review_plot_widget.plot(
                 pen=pg.mkPen("#0080c8", width=1.5), name="磁场/mT"
@@ -1393,44 +1458,48 @@ class GaussMeterGUI(QMainWindow):
             heatmap_page = QWidget()
             heatmap_layout = QVBoxLayout(heatmap_page)
             heatmap_layout.setContentsMargins(0, 0, 0, 0)
-            heatmap_ctrl = QHBoxLayout()
-            heatmap_ctrl.addWidget(QLabel("值 / Value:"))
+            heatmap_ctrl = QGridLayout()
+            heatmap_ctrl.setHorizontalSpacing(10)
+            heatmap_ctrl.setVerticalSpacing(6)
+            heatmap_ctrl.addWidget(QLabel("值 / Value:"), 0, 0)
             self._review_heatmap_channel_combo = QComboBox()
             self._review_heatmap_channel_combo.currentTextChanged.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_channel_combo)
-            heatmap_ctrl.addWidget(QLabel("网格 / Grid:"))
+            heatmap_ctrl.addWidget(self._review_heatmap_channel_combo, 0, 1)
+            heatmap_ctrl.addWidget(QLabel("网格 / Grid:"), 0, 2)
             self._review_heatmap_mode_combo = QComboBox()
             self._review_heatmap_mode_combo.addItem("原始网格 / Raw", "raw")
             self._review_heatmap_mode_combo.addItem("插值网格 / Interpolated", "interpolated")
             self._review_heatmap_mode_combo.currentTextChanged.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_mode_combo)
-            heatmap_ctrl.addWidget(QLabel("分辨率 / Resolution:"))
+            heatmap_ctrl.addWidget(self._review_heatmap_mode_combo, 0, 3)
+            heatmap_ctrl.addWidget(QLabel("分辨率 / Resolution:"), 0, 4)
             self._review_heatmap_resolution_spin = QSpinBox()
             self._review_heatmap_resolution_spin.setRange(10, 300)
             self._review_heatmap_resolution_spin.setValue(80)
             self._review_heatmap_resolution_spin.valueChanged.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_resolution_spin)
+            heatmap_ctrl.addWidget(self._review_heatmap_resolution_spin, 0, 5)
             self._review_heatmap_auto_levels_cb = QCheckBox("自动色阶 / Auto Levels")
             self._review_heatmap_auto_levels_cb.setChecked(True)
             self._review_heatmap_auto_levels_cb.toggled.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_auto_levels_cb)
+            heatmap_ctrl.addWidget(self._review_heatmap_auto_levels_cb, 0, 6)
             self._review_heatmap_min_edit = QLineEdit()
             self._review_heatmap_min_edit.setPlaceholderText("min")
-            self._review_heatmap_min_edit.setFixedWidth(80)
+            self._review_heatmap_min_edit.setMinimumWidth(100)
             self._review_heatmap_min_edit.editingFinished.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_min_edit)
+            heatmap_ctrl.addWidget(QLabel("最小 / Min:"), 1, 0)
+            heatmap_ctrl.addWidget(self._review_heatmap_min_edit, 1, 1)
             self._review_heatmap_max_edit = QLineEdit()
             self._review_heatmap_max_edit.setPlaceholderText("max")
-            self._review_heatmap_max_edit.setFixedWidth(80)
+            self._review_heatmap_max_edit.setMinimumWidth(100)
             self._review_heatmap_max_edit.editingFinished.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_max_edit)
+            heatmap_ctrl.addWidget(QLabel("最大 / Max:"), 1, 2)
+            heatmap_ctrl.addWidget(self._review_heatmap_max_edit, 1, 3)
             self._review_heatmap_contour_cb = QCheckBox("等值线 / Contour")
             self._review_heatmap_contour_cb.toggled.connect(self._update_review_plot)
-            heatmap_ctrl.addWidget(self._review_heatmap_contour_cb)
+            heatmap_ctrl.addWidget(self._review_heatmap_contour_cb, 1, 4)
             self._review_heatmap_export_btn = QPushButton("导出 PNG / Export PNG")
             self._review_heatmap_export_btn.clicked.connect(self._on_export_review_heatmap_image)
-            heatmap_ctrl.addWidget(self._review_heatmap_export_btn)
-            heatmap_ctrl.addStretch()
+            heatmap_ctrl.addWidget(self._review_heatmap_export_btn, 1, 5)
+            heatmap_ctrl.setColumnStretch(6, 1)
             heatmap_layout.addLayout(heatmap_ctrl)
             self._review_heatmap_status = QLabel("载入包含 x_mm/y_mm 的数据后显示空间热图")
             self._review_heatmap_status.setStyleSheet("color: #555; padding: 4px;")
@@ -1440,7 +1509,7 @@ class GaussMeterGUI(QMainWindow):
             self._review_heatmap_widget.setLabel("bottom", "X", units="mm")
             self._review_heatmap_widget.setLabel("left", "Y", units="mm")
             self._review_heatmap_widget.showGrid(x=True, y=True, alpha=0.25)
-            self._review_heatmap_widget.setMinimumHeight(300)
+            self._review_heatmap_widget.setMinimumHeight(420)
             self._review_heatmap_item = pg.ImageItem()
             self._review_heatmap_contours = []
             try:
@@ -1495,12 +1564,12 @@ class GaussMeterGUI(QMainWindow):
                     " Other review plots remain available." + surface_error
                 )
                 missing.setAlignment(Qt.AlignCenter)
-                missing.setMinimumHeight(300)
+                missing.setMinimumHeight(420)
                 surface_layout.addWidget(missing, 1)
             self._review_plot_tabs.addTab(surface_page, "3D Surface")
             self._review_plot_tabs.currentChanged.connect(self._on_review_plot_tab_changed)
 
-            layout.addWidget(self._review_plot_tabs, 1)
+            plot_tab_layout.addWidget(self._review_plot_tabs, 1)
         else:
             self._review_plot_widget = None
             self._review_region = None
@@ -1525,16 +1594,20 @@ class GaussMeterGUI(QMainWindow):
             self._review_surface_export_btn = None
             no_plot = QLabel("pyqtgraph 未安装, 图表不可用 / pyqtgraph not installed")
             no_plot.setAlignment(Qt.AlignCenter)
-            layout.addWidget(no_plot, 1)
+            plot_tab_layout.addWidget(no_plot, 1)
 
         self._review_table = QTableWidget()
         self._review_table.setColumnCount(6)
         self._review_table.setHorizontalHeaderLabels(["Seq", "Time(s)", "Field", "Freq", "Temp", "Source"])
+        self._review_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._review_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._review_table.setMaximumHeight(180)
+        self._review_table.setMinimumHeight(220)
+        self._review_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._review_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._review_table.setAlternatingRowColors(True)
         self._review_table.itemSelectionChanged.connect(self._on_review_table_selection_changed)
-        layout.addWidget(self._review_table)
+        table_tab_layout.addWidget(self._review_table, 1)
 
         # 控制区
         ctrl_row = QHBoxLayout()
@@ -1542,7 +1615,7 @@ class GaussMeterGUI(QMainWindow):
         self._review_show_freq_cb.toggled.connect(self._update_review_plot)
         ctrl_row.addWidget(self._review_show_freq_cb)
         ctrl_row.addStretch()
-        layout.addLayout(ctrl_row)
+        plot_tab_layout.addLayout(ctrl_row)
 
         return page
 

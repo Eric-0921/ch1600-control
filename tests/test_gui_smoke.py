@@ -13,6 +13,7 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from app.config_io import DEFAULT_CONFIG
@@ -81,6 +82,14 @@ class TestGUISmoke(unittest.TestCase):
                 pidx = window._probe_profile_combo.findData("weak_field")
                 window._probe_profile_combo.setCurrentIndex(pidx)
                 self.assertEqual(window._probe_profile, "weak_field")
+                self.assertEqual(window._live_tabs.count(), 3)
+                self.assertEqual(window._review_main_tabs.count(), 4)
+                self.assertIn("筛选统计", window._review_main_tabs.tabText(1))
+                self.assertIn("数据表", window._review_main_tabs.tabText(3))
+                self.assertEqual(window._data_table.verticalScrollBarPolicy(), Qt.ScrollBarAlwaysOn)
+                self.assertEqual(window._review_table.verticalScrollBarPolicy(), Qt.ScrollBarAlwaysOn)
+                self.assertIn("Apply Filter", window._review_apply_filter_btn.text())
+                self.assertIn("刷新图表", window._review_apply_filter_btn.toolTip())
             finally:
                 window.close()
         self.assertIsNotNone(app)
