@@ -384,3 +384,22 @@ python -m compileall app core data instruments workers tests
 python -m unittest discover -v
 python main.py
 ```
+## 2026-05-21 Anti-Regression Note for Future Agents
+
+Do not use this roadmap as permission to revert the protocol to older, more
+conservative assumptions. The reverse-engineered vendor/debug program and real
+CH-1600 validation now take precedence for command framing and high-speed data.
+
+Hard constraints from the current working system:
+
+- Send raw ASCII commands without CR/LF.
+- Keep 20 Hz high-speed mode as `FAST2>` for the tested CH-1600.
+- Keep `FAST150>` and `FAST250>` as explicit modes.
+- Keep high-speed single-value frame parsing.
+- Keep monitor polling out of active high-speed acquisition.
+- Keep manual COM connection available even when scan verification fails.
+- Keep `DATAC>` available for recovery even after preview/panel stream detection.
+
+If a later change intentionally violates one of these constraints, include a
+fresh hardware validation log and update `CHANGELOG.md`, `AGENTS.md`, and
+`docs/reverse_engineering_findings.md` in the same commit.

@@ -65,6 +65,13 @@ class CH1600StreamWorker(QObject):
         batch_points: List[Dict[str, float]] = []
         batch_start = time.perf_counter()
         latest_point: Dict[str, float] = {}
+        start_time = time.perf_counter()
+        last_raw_time: Optional[float] = None
+        last_parsed_time: Optional[float] = None
+        last_watchdog_log = start_time
+        raw_bytes_seen = 0
+        unparsed_frames = 0
+        last_unparsed = ""
 
         try:
             while not self._stop_requested:
@@ -76,12 +83,19 @@ class CH1600StreamWorker(QObject):
                     # 非阻塞读取所有可用字节
                     raw = self._driver.read_stream_data()
                     if raw:
+                        now = time.perf_counter()
+                        last_raw_time = now
+                        raw_bytes_seen += len(raw)
                         self._read_buffer += raw
                         consecutive_errors = 0
+                        self._read_buffer = self._read_buffer.replace(b"\r", b"\n")
 
                         # 按 \n 分割完整帧
                         while b"\n" in self._read_buffer:
                             line, self._read_buffer = self._read_buffer.split(b"\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
                             parsed = CH1600Driver.parse_stream_frame(
                                 line, model=self._device_model
                             )
@@ -91,9 +105,39 @@ class CH1600StreamWorker(QObject):
                                 batch_points.append(parsed)
                                 latest_point = parsed
                                 self._point_count += 1
+                                last_parsed_time = time.perf_counter()
+                            else:
+                                unparsed_frames += 1
+                                last_unparsed = line.decode("ascii", errors="replace")
 
                     # 检查是否需要发射批次
                     now = time.perf_counter()
+                    if now - last_watchdog_log >= 2.0:
+                        if last_raw_time is None and now - start_time >= 2.0:
+                            self.log_requested.emit(
+                                "[CH-1600] stream started but no raw serial data after 2s"
+                            )
+                            last_watchdog_log = now
+                        elif raw_bytes_seen > 0 and self._point_count == 0 and now - start_time >= 2.0:
+                            self.error_occurred.emit(
+                                "[CH-1600] raw serial data received but no frame parsed; "
+                                f"raw_bytes={raw_bytes_seen}, unparsed={unparsed_frames}, "
+                                f"last={last_unparsed!r}"
+                            )
+                            last_watchdog_log = now
+                        elif (
+                            last_parsed_time is not None
+                            and last_raw_time is not None
+                            and last_raw_time > last_parsed_time
+                            and now - last_parsed_time >= 2.0
+                            and unparsed_frames > 0
+                        ):
+                            self.log_requested.emit(
+                                "[CH-1600] some raw frames were not parsed: "
+                                f"unparsed={unparsed_frames}, last={last_unparsed!r}"
+                            )
+                            last_watchdog_log = now
+
                     should_emit = False
 
                     if len(batch_points) >= self._batch_size:

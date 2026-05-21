@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="GBK"?>
+<SystemConfig>
+  <key name="MODEL" value="CH-1600" />
+  <key name="COMWAY" value="串口" />
+  <key name="COMMSET" value="COM13" />
+  <key name="BADURATE" value="115200" />
+  <key name="DATATYPE" value="高速数据" />
+  <key name="SPEED" value="20组/s" />
+</SystemConfig>

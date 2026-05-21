@@ -37,6 +37,15 @@ class TestParse1DGauss(unittest.TestCase):
         self.assertAlmostEqual(result["field_x_mt"], 1.2345, places=6)
         self.assertAlmostEqual(result["temp_c"], 12.3, places=2)
 
+    def test_fast_single_value_frame(self):
+        """原厂 FAST2>/FASTxxx> 高速帧只包含磁场值"""
+        line = b"#+0000.1496>\n"
+        result = CH1600Driver.parse_stream_frame(line, model="1d_gauss")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["field_x_mt"], 0.1496, places=6)
+        self.assertAlmostEqual(result["freq_hz"], 0.0, places=6)
+        self.assertAlmostEqual(result["temp_c"], 0.0, places=6)
+
     def test_dc_zero_freq(self):
         """DC 模式频率为 000"""
         line = b"#-00000.0001/000/+0000>\n"
@@ -353,6 +362,13 @@ class FakeSerial:
         self.close()
 
 
+class DataProbeFakeSerial(FakeSerial):
+    def write(self, data: bytes) -> None:
+        super().write(data)
+        if data == b"DATA?>":
+            self._buffer += b"#+0000.1357/000/+0283>\n"
+
+
 class TestCommandFraming(unittest.TestCase):
     def _driver_with_fake_serial(self, response: bytes = b""):
         driver = CH1600Driver()
@@ -361,43 +377,64 @@ class TestCommandFraming(unittest.TestCase):
         driver._panel_streaming_mode = False
         return driver, fake
 
-    def test_send_command_adds_protocol_terminator(self):
+    def test_send_command_uses_raw_ascii_without_cr(self):
         driver, fake = self._driver_with_fake_serial(b"mT\n")
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             result = driver._send_command("UNIT?")
         self.assertEqual(result, b"mT\n")
-        self.assertEqual(fake.writes[-1], b"UNIT?>\r")
+        self.assertEqual(fake.writes[-1], b"UNIT?>")
 
     def test_send_command_does_not_duplicate_terminator(self):
         driver, fake = self._driver_with_fake_serial()
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             driver._send_command("DATA?>")
-        self.assertEqual(fake.writes[-1], b"DATA?>\r")
+        self.assertEqual(fake.writes[-1], b"DATA?>")
 
     def test_start_streaming_uses_1d_fast2_shorthand(self):
         driver, fake = self._driver_with_fake_serial()
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             driver.start_streaming(mode_key="dc_20hz", model="1d_gauss")
-        self.assertEqual(fake.writes[-1], b"FAST2>\r")
+        self.assertEqual(fake.writes[-1], b"FAST2>")
         self.assertTrue(driver.is_streaming)
+
+    def test_start_streaming_uses_fast2_for_20hz_all_models(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.start_streaming(mode_key="dc_20hz", model="2d_gauss")
+        self.assertEqual(fake.writes[-1], b"FAST2>")
+
+    def test_start_streaming_has_150_and_250_hz_commands(self):
+        driver, fake = self._driver_with_fake_serial()
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.start_streaming(mode_key="dc_150hz", model="1d_gauss")
+            driver.start_streaming(mode_key="dc_250hz", model="1d_gauss")
+        self.assertIn(b"FAST150>", fake.writes)
+        self.assertIn(b"FAST250>", fake.writes)
 
     def test_start_streaming_preserves_fast_command_suffix(self):
         driver, fake = self._driver_with_fake_serial()
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             driver.start_streaming(mode_key="dc_100hz", model="2d_gauss")
-        self.assertEqual(fake.writes[-1], b"FAST100>\r")
+        self.assertEqual(fake.writes[-1], b"FAST100>")
+
+    def test_stop_streaming_sends_datac_even_after_preview_stream(self):
+        driver, fake = self._driver_with_fake_serial()
+        driver._panel_streaming_mode = True
+        with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            driver.stop_streaming()
+        self.assertEqual(fake.writes[-1], b"DATAC>")
 
     def test_threshold_command_is_framed(self):
         driver, fake = self._driver_with_fake_serial()
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             driver.set_up_threshold(-1.23)
-        self.assertEqual(fake.writes[-1], b"UPTHRES-1.23>\r")
+        self.assertEqual(fake.writes[-1], b"UPTHRES-1.23>")
 
     def test_query_data_once_uses_requested_model(self):
         driver, fake = self._driver_with_fake_serial(b"ACK#3.0/4.0/12.0>\n")
         with patch("instruments.ch1600_driver._time.sleep", lambda _: None):
             result = driver.query_data_once(model="3d_fluxgate")
-        self.assertEqual(fake.writes[-1], b"DATAS>\r")
+        self.assertEqual(fake.writes[-1], b"DATAS>")
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result["field_x_mt"], 3.0, places=6)
         self.assertAlmostEqual(result["field_y_mt"], 4.0, places=6)
@@ -412,6 +449,17 @@ class TestCommandFraming(unittest.TestCase):
                 driver.connect("COM_FAKE")
         self.assertTrue(fake.closed)
 
+    def test_connect_accepts_data_probe_when_unit_is_empty(self):
+        fake = DataProbeFakeSerial(response=b"")
+        driver = CH1600Driver()
+        with patch("instruments.ch1600_driver.serial.Serial", return_value=fake), \
+             patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            idn = driver.connect("COM_FAKE")
+        self.assertIn("DATA?> verified", idn)
+        self.assertIn(b"DATA?>", fake.writes)
+        self.assertIn(b"DATAC>", fake.writes)
+        driver.close()
+
     def test_scan_ports_omits_unverified_devices(self):
         class Port:
             device = "COM_FAKE"
@@ -419,6 +467,16 @@ class TestCommandFraming(unittest.TestCase):
         with patch("serial.tools.list_ports.comports", return_value=[Port()]), \
              patch("instruments.ch1600_driver.serial.Serial", return_value=FakeSerial(response=b"noise\n")):
             self.assertEqual(CH1600Driver.scan_ports(), [])
+
+    def test_scan_ports_accepts_data_probe_device(self):
+        class Port:
+            device = "COM_FAKE"
+
+        fake = DataProbeFakeSerial(response=b"")
+        with patch("serial.tools.list_ports.comports", return_value=[Port()]), \
+             patch("instruments.ch1600_driver.serial.Serial", return_value=fake), \
+             patch("instruments.ch1600_driver._time.sleep", lambda _: None):
+            self.assertEqual(CH1600Driver.scan_ports(), [("COM_FAKE", "CH-1600 [DATA?> verified]")])
 
 
 if __name__ == "__main__":

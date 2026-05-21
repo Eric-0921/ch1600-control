@@ -133,7 +133,7 @@ class TestGUISmoke(unittest.TestCase):
                 window.close()
         self.assertIsNotNone(app)
 
-    def test_scan_with_no_verified_ports_keeps_connect_disabled(self):
+    def test_scan_with_no_verified_ports_allows_manual_connect(self):
         app = QApplication.instance() or QApplication([])
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["database"]["enabled"] = False
@@ -144,8 +144,30 @@ class TestGUISmoke(unittest.TestCase):
             try:
                 window._connect_btn.setEnabled(True)
                 window._on_scan_ports()
-                self.assertFalse(window._connect_btn.isEnabled())
-                self.assertIn("No device found", window._port_combo.currentText())
+                self.assertTrue(window._connect_btn.isEnabled())
+                self.assertEqual(window._port_combo.currentText(), cfg["ch1600"]["port"])
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    @unittest.skipUnless(_HAS_PYG, "pyqtgraph not available")
+    def test_save_chart_uses_exporters_module(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        tmp_dir = Path(tempfile.mkdtemp())
+        out_path = tmp_dir / "chart.png"
+        with (
+            patch("app.gui.load_config", return_value=cfg),
+            patch("app.gui.save_config"),
+            patch("app.gui.QFileDialog.getSaveFileName", return_value=(str(out_path), "PNG (*.png)")),
+            patch("app.gui.QMessageBox.critical") as critical,
+        ):
+            window = GaussMeterGUI()
+            try:
+                window._on_save_chart()
+                self.assertTrue(out_path.exists())
+                critical.assert_not_called()
             finally:
                 window.close()
         self.assertIsNotNone(app)

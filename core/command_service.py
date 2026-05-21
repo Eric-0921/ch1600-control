@@ -266,9 +266,10 @@ class CommandService(QObject):
             mode_key=mode_key,
             device_model=device_model,
         )
-        if started:
-            interval_ms = self._cfg.get("monitor", {}).get("interval_ms", 500)
-            self._ctrl.start_monitoring(interval_ms=interval_ms)
+        # Do not poll UNIT/RANGE while the high-speed stream is running.  On
+        # real CH-1600 hardware those query bytes can interleave with FAST/DATA
+        # frames during startup, leaving the GUI in "transmitting but no batch"
+        # state.
         return started
 
     def stop_acquisition(self) -> None:

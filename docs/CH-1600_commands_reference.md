@@ -204,3 +204,25 @@ ACK#X轴数值/X轴频率/X轴温度;Y轴数值/Y轴频率/Y轴温度;Z轴数值
 - 同型号探头可直接替换，无需重新校准
 - **连接前必须关闭设备电源**（上电后连接可能导致存储器失效）
 - 预热：至少 5 分钟，10 分钟后达到额定精度
+## 2026-05-21 Field Note: Tested CH-1600 Command Framing
+
+The real CH-1600 connected on `COM13` and the decompiled vendor/debug program
+show that this hardware expects raw ASCII command frames. Do not add CR/LF for
+this tested path.
+
+Validated examples:
+
+- Start normal stream: `DATA?>`
+- Stop stream: `DATAC>`
+- Zero: `ZERO>`
+- High speed: `FAST2>`, `FAST050>`, `FAST100>`, `FAST150>`, `FAST200>`,
+  `FAST250>`, `FAST300>`
+
+Important anti-regression notes for agents:
+
+- `DATA?>` responded in live validation; `DATA?>\r` did not.
+- 20 Hz is `FAST2>` for the tested CH-1600, not `FAST020>`.
+- High-speed frames can be single-value frames like `#+0000.1433>`.
+- Do not use this reference to reintroduce CR terminators or `FAST020>` unless
+  a new live-device trace proves that a different hardware/firmware revision
+  needs it.

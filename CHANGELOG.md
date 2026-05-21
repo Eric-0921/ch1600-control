@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased] - 2026-05-21
+
+### Added
+
+- Added `reverse-engineered-debugv3/` as the reverse-engineering workspace for
+  the vendor CH-1600/DataReader2 debug software, including decompiled-source
+  notes, protocol findings, GUI command mapping, live COM13 validation notes,
+  and agent handoff documentation.
+- Added prominent agent/maintainer warnings in project documentation. These
+  warnings record that future agents must not replace live-device findings with
+  conservative manual guesses, especially around command framing and high-speed
+  mode commands.
+
+### Changed
+
+- Updated the runtime protocol implementation to follow the decompiled vendor
+  source and real CH-1600 validation:
+  - CH-1600 commands are sent as raw ASCII frames with no CR/LF appended.
+  - 20 Hz high-speed acquisition uses `FAST2>` on the tested CH-1600.
+  - 150 Hz, 250 Hz, and 300 Hz modes are explicit `FAST150>`, `FAST250>`, and
+    `FAST300>` entries.
+  - High-speed single-value frames such as `#+0000.1433>` are parsed.
+  - Low-rate monitor polling is not started during high-speed acquisition.
+  - Preview/panel stream detection no longer suppresses `DATAC>` recovery.
+  - Scan failure no longer disables manual COM-port connection.
+- Fixed chart export for pyqtgraph 0.14.0 by importing
+  `pyqtgraph.exporters` explicitly and selecting `SVGExporter` for SVG output.
+
+### Validation
+
+- Live device validation on `COM13` confirmed:
+  - `scan_ports()` returns `CH-1600 [DATA?> verified]`.
+  - `connect("COM13", 115200)` returns `CH-1600@COM13 (DATA?> verified)`.
+  - `FAST2>` produces parseable high-speed frames.
+- `python -m unittest discover -v` passed with 79 tests.
+- `python -m compileall app core data instruments workers tests` passed.
+
 All notable changes to this project are documented in this file.
 
 ## [Unreleased] — 2026-05-18

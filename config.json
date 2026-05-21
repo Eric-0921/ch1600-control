@@ -14,7 +14,7 @@
   "acquisition": {
     "save_dir": "./experiments",
     "auto_save": false,
-    "mode_key": "dc_normal",
+    "mode_key": "dc_50hz",
     "zero_offset": 0.0,
     "zero_offsets": {},
     "threshold_channel": "field_total",
@@ -40,7 +40,7 @@
   },
   "ui": {
     "display_interval_ms": 30,
-    "chart_history_points": 5000,
+    "chart_history_points": 6563,
     "chart_downsample": 2,
     "chart_colors": {
       "field": "#0080c8",
@@ -48,7 +48,8 @@
     },
     "chart_line_width": 2,
     "window_width": 1200,
-    "window_height": 800
+    "window_height": 800,
+    "display_unit": "mGs"
   },
   "external_ipc": {
     "enabled": false,

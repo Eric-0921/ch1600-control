@@ -56,8 +56,10 @@ from app.surface_renderer import SurfaceRenderer
 
 try:
     import pyqtgraph as pg
+    import pyqtgraph.exporters as pg_exporters
     _HAS_PYG = True
 except ImportError:
+    pg_exporters = None
     _HAS_PYG = False
 
 _HAS_PYG_GL = SurfaceRenderer.is_available()
@@ -597,6 +599,9 @@ class GaussMeterGUI(QMainWindow):
         self._port_combo = QComboBox()
         self._port_combo.setEditable(True)
         self._port_combo.setMinimumWidth(150)
+        default_port = self._cfg.get("ch1600", {}).get("port", "")
+        if default_port:
+            self._port_combo.addItem(default_port, default_port)
         g.addWidget(self._port_combo, 0, 1)
 
         g.addWidget(QLabel("波特率 / Baud:"), 0, 2)
@@ -616,7 +621,7 @@ class GaussMeterGUI(QMainWindow):
         self._connect_btn = QPushButton("连接 / Connect")
         self._connect_btn.setObjectName("primaryBtn")
         self._connect_btn.clicked.connect(self._on_connect)
-        self._connect_btn.setEnabled(False)
+        self._connect_btn.setEnabled(True)
         btn_row.addWidget(self._connect_btn)
 
         self._disconnect_btn = QPushButton("断开 / Disconnect")
@@ -668,8 +673,9 @@ class GaussMeterGUI(QMainWindow):
         self._sample_rate_combo = QComboBox()
         # 按 ACQ_MODE_TABLE 的 key 顺序
         self._rate_keys = ["dc_normal", "dc_20hz", "dc_50hz", "dc_100hz",
-                           "dc_200hz", "dc_200plus",
-                           "ac_20hz", "ac_50hz", "ac_100hz", "ac_200hz"]
+                           "dc_150hz", "dc_200hz", "dc_250hz", "dc_300hz",
+                           "ac_20hz", "ac_50hz", "ac_100hz", "ac_150hz",
+                           "ac_200hz", "ac_250hz", "ac_300hz"]
         for k in self._rate_keys:
             self._sample_rate_combo.addItem(ACQ_MODE_TABLE[k]["label"], k)
         self._sample_rate_combo.currentIndexChanged.connect(self._on_acq_mode_changed)
@@ -719,8 +725,8 @@ class GaussMeterGUI(QMainWindow):
             "<br>"
             "<b>▶ 采集速率调节（已支持软件远程切换）：</b><br>"
             "  软件可直接通过 RS-232 发送 FASTxxx> 指令切换采样速率。<br>"
-            "  常速: DATA?> | 20Hz: FAST020> | 50Hz: FAST050> | 100Hz: FAST100><br>"
-            "  200Hz: FAST200> | 200+Hz: FAST300><br>"
+            "  常速: DATA?> | 20Hz: FAST2> | 50Hz: FAST050> | 100Hz: FAST100><br>"
+            "  150Hz: FAST150> | 200Hz: FAST200> | 250Hz: FAST250> | 300Hz: FAST300><br>"
             "  <i>出厂默认：常速 (~4-10 Hz, 最高精度 ±0.00001 mT)。</i><br>"
             "  <i>速率越高精度越低，详见说明书表 4-2。</i><br>"
             "<br>"
@@ -2674,7 +2680,7 @@ class GaussMeterGUI(QMainWindow):
         tx_ctrl.addStretch()
         tx_v.addLayout(tx_ctrl)
         quick_row = QHBoxLayout()
-        for cmd in ["DATA?>", "DATAC>", "DATAS>", "ZERO>", "FAST020>", "FAST100>", "FAST300>"]:
+        for cmd in ["DATA?>", "DATAC>", "DATAS>", "ZERO>", "FAST2>", "FAST050>", "FAST100>", "FAST300>"]:
             btn = QPushButton(cmd)
             btn.clicked.connect(lambda checked, c=cmd: self._debug_tx_input.setText(c))
             quick_row.addWidget(btn)
@@ -2768,9 +2774,10 @@ class GaussMeterGUI(QMainWindow):
             self._connect_btn.setEnabled(True)
             self.log(f"[GUI] 找到 {len(ports)} 个端口")
         else:
-            self._port_combo.addItem("未找到设备 / No device found")
-            self._connect_btn.setEnabled(False)
-            self.log("[GUI] 未找到 CH-1600 设备")
+            manual_port = self._cfg.get("ch1600", {}).get("port", "COM13")
+            self._port_combo.addItem(manual_port, manual_port)
+            self._connect_btn.setEnabled(True)
+            self.log("[GUI] 未扫描到已验证设备，可手动输入 COM 口后连接")
 
     def _on_connect(self) -> None:
         if self._cmd_service is None:
@@ -2778,7 +2785,7 @@ class GaussMeterGUI(QMainWindow):
         port_text = self._port_combo.currentText()
         port = port_text.split(" - ")[0].strip() if " - " in port_text else port_text.strip()
         if not port or "未找到设备" in port or "No device found" in port:
-            self.log("[GUI] 未选择已验证的 CH-1600 串口")
+            self.log("[GUI] 未输入 CH-1600 串口")
             return
         baud = int(self._baud_combo.currentText())
 
@@ -3222,7 +3229,7 @@ class GaussMeterGUI(QMainWindow):
 
     def _on_save_chart(self) -> None:
         """导出图表为 PNG/SVG/JPG 图片。"""
-        if not _HAS_PYG or self._plot_widget is None:
+        if not _HAS_PYG or pg_exporters is None or self._plot_widget is None:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "保存图表", "chart.png",
@@ -3231,7 +3238,11 @@ class GaussMeterGUI(QMainWindow):
         if not path:
             return
         try:
-            exporter = pg.exporters.ImageExporter(self._plot_widget.plotItem)
+            suffix = Path(path).suffix.lower()
+            if suffix == ".svg":
+                exporter = pg_exporters.SVGExporter(self._plot_widget.plotItem)
+            else:
+                exporter = pg_exporters.ImageExporter(self._plot_widget.plotItem)
             exporter.export(path)
             self.log(f"[GUI] 图表已保存: {path}")
         except Exception as exc:
@@ -3744,6 +3755,13 @@ class GaussMeterGUI(QMainWindow):
             mode = self._get_active_acq_mode()
             short_label = mode["label"].split("(")[0].strip()
             self._global_info.setText(f"{unit} | {rng} | {short_label}")
+
+        connected = bool(state.get("connected", self._ctrl.is_connected if self._ctrl else False))
+        streaming = bool(state.get("streaming", self._ctrl.is_streaming if self._ctrl else False))
+        self._update_global_bar(connected, streaming)
+        if connected and not streaming and hasattr(self, "_stream_start_btn"):
+            self._stream_start_btn.setEnabled(True)
+            self._stream_stop_btn.setEnabled(False)
 
     def _on_error(self, msg: str) -> None:
         self.log(f"[ERROR] {msg}")

@@ -1,5 +1,28 @@
 # CH-1600 Digital Gauss Meter Control & Data Acquisition
 
+## Maintainer / Agent Warning
+
+This repository includes `reverse-engineered-debugv3/`, a reverse-engineering
+workspace for the vendor CH-1600/DataReader2 debug program, plus live validation
+against a real CH-1600 connected on `COM13`.
+
+Do not "normalize" the protocol back to older manual assumptions or cautious
+generic serial behavior. The current implementation intentionally follows the
+decompiled vendor behavior and live-device results:
+
+- Commands are raw ASCII frames with no CR/LF appended: `DATA?>`, `DATAC>`,
+  `FAST2>`, `FAST050>`, `FAST100>`, `FAST150>`, `FAST200>`, `FAST250>`,
+  `FAST300>`.
+- 20 Hz high-speed mode is `FAST2>` on the tested CH-1600, not `FAST020>`.
+- High-speed data frames may be single-value frames such as `#+0000.1433>`.
+- Low-rate status polling must not run during high-speed streaming.
+- Preview/panel streaming detection must not disable `DATAC>` recovery.
+- Scan failure must not prevent manual connection to a known COM port.
+
+If a future agent finds an older README/manual/roadmap statement saying CR
+terminators or `FAST020>` are required, treat that statement as stale unless a
+new live-device test proves it for the specific hardware under test.
+
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![PyQt5](https://img.shields.io/badge/PyQt-5.15-green.svg)](https://www.riverbankcomputing.com/software/pyqt/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

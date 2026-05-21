@@ -507,3 +507,32 @@ C# 的 `FG_analyse` 和 `F_analyse` **没有显式检查 `#`**，而是直接用
 ---
 
 > 最后更新：2026-05-18 | 审查范围：Form1.cs OD_analyse / TD_analyse / TTD_analyse / F_analyse / FG_analyse / TFG_analyse / PipeMessageRecive / GoPipe，SerialPort_Connect.cs RecMethod / Write；官方命令参考探头接口 / DATAS / 探头信息
+## 2026-05-21 Live-Device Correction and Agent Discipline Note
+
+This document has older sections that were written before the real CH-1600 on
+`COM13` was validated against the decompiled vendor/debug program. Do not remove
+those historical notes, but do not treat them as stronger than the live findings
+below.
+
+Authoritative current findings:
+
+- The tested CH-1600 expects raw ASCII commands with no appended CR/LF. Examples:
+  `DATA?>`, `DATAC>`, `ZERO>`, `FAST2>`, `FAST050>`, `FAST100>`, `FAST150>`,
+  `FAST200>`, `FAST250>`, `FAST300>`.
+- `DATA?>` produced data during live validation; `DATA?>\r` did not.
+- 20 Hz high-speed mode uses `FAST2>` on the tested CH-1600. Do not restore
+  `FAST020>` for this path without a new hardware trace.
+- High-speed frames can be single-value frames such as `#+0000.1433>`; frequency
+  and temperature are intentionally reported as `0` for those frames.
+- The original/debug program and current driver can put the instrument into
+  `transmitting`; a Python GUI that shows transmitting but no chart/table updates
+  is usually dropping or failing to parse received frames, not proving the device
+  is silent.
+- Monitor queries (`UNIT?>`, `RANGE?>`) must not be sent during high-speed
+  startup/streaming. They can interfere with the stream path.
+- A detected stream at connect time may be a leftover remote stream. Do not
+  label it as command-locked in a way that prevents `DATAC>` recovery.
+
+Agent instruction: when the decompiled vendor source, live COM13 validation, and
+older docs disagree, preserve the live/decompiled behavior. Do not make
+"conservative" protocol changes just because they look more standard.

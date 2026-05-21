@@ -2,6 +2,39 @@
 
 > This file is intended for AI coding agents. Assume the reader knows nothing about the project.
 
+## Critical Agent Warning: Do Not "Conservatively" Rewrite the Proven Protocol
+
+This project now contains a reverse-engineering subproject at
+`reverse-engineered-debugv3/` and live-device validation against a real CH-1600
+on `COM13`. Future agents must treat those findings as authoritative unless a
+new live-device test proves otherwise.
+
+Previous agent passes introduced overly conservative behavior by trusting manual
+or guessed protocol shapes over the decompiled vendor program and real hardware.
+Do not repeat that pattern. In particular:
+
+- Do not add CR/LF to CH-1600 commands. The tested device responds to raw ASCII
+  commands such as `DATA?>`, `DATAC>`, `FAST2>`, `FAST050>`, `FAST100>`,
+  `FAST150>`, `FAST200>`, `FAST250>`, and `FAST300>`. It did not respond to
+  `DATA?>\r` in the live validation.
+- Do not change 20 Hz high-speed mode back to `FAST020>` for the tested CH-1600.
+  The decompiled vendor software and live tests use `FAST2>`.
+- Do not assume a detected preview stream means "RS-232 commands unavailable".
+  It may be a leftover remote `DATA?>`/`FAST...>` stream. Always preserve the
+  ability to send `DATAC>` for recovery.
+- Do not start low-rate `UNIT?>`/`RANGE?>` monitoring during high-speed
+  acquisition. It can interleave query bytes with stream frames during startup.
+- Do not silently swallow raw serial data that fails parsing. Surface raw-frame
+  samples in logs/errors so the next operator can see whether the device is
+  sending data.
+- Do not make scan success a hard prerequisite for manual COM connection.
+  Debugging must allow a known port such as `COM13` to be entered directly.
+
+When a manual, README, or older roadmap entry conflicts with decompiled vendor
+source plus live-device evidence, keep the evidence and update the stale
+documentation incrementally. Do not "tidy" the code back into a more generic or
+more conservative protocol unless you also add a reproducible hardware trace.
+
 ## Project Overview
 
 This is a Python control and data acquisition application for the **CH-1600 Digital Gauss Meter / Teslameter** (Beijing Cuihai Jiacheng Magnetic Electric Technology). It communicates with the device via RS-232 serial port and provides:

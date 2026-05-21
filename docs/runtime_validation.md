@@ -91,3 +91,23 @@ git diff --check
 - `HST/HSE/UHS` 特殊前缀 raw 缩放。
 - 标准/弱磁/自定义探头的真实帧、量程和温度行为。
 - 探头 EEPROM/非易失存储器是否存在可读串口协议。
+## 2026-05-21 CH-1600 COM13 Live Validation
+
+Hardware validation was run against the actual CH-1600 connected as `COM13`
+through a CH340 USB serial adapter at 115200 baud.
+
+Results:
+
+- `CH1600Driver.scan_ports()` returned `('COM13', 'CH-1600 [DATA?> verified]')`.
+- `CH1600Driver.connect('COM13', 115200)` returned
+  `CH-1600@COM13 (DATA?> verified)`.
+- `FAST2>` caused the device to stream high-speed frames such as
+  `#+0000.1433>`, which parsed as a single magnetic-field value.
+- `DATAC>` stopped the stream path after the validation script.
+- Previous direct tests showed `DATA?>` works while `DATA?>\r` does not on this
+  hardware.
+
+Agent warning: future validation or refactoring must not silently replace these
+observed commands with manual-style CR-terminated commands. If another hardware
+revision behaves differently, document it as a new hardware profile instead of
+overwriting this one.

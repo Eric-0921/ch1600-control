@@ -2,7 +2,7 @@
 
 协议规格:
 - 异步串行: 1 起始位 + 8 数据位 + 1 停止位, 无校验
-- 命令结束符: CR (0x0D)
+- 命令: 原厂软件直接发送 ASCII 命令体（例如 DATA?>、DATAC>），真机实测不接受追加 CR
 - 响应终止符: \\n (换行符)
 - 波特率: 19200 / 57600 / 115200 (默认 115200)
 - 半双工, 最大 10 命令/秒
@@ -148,6 +148,9 @@ class CH1600Driver:
 
         自动检测面板实时发送模式: 连接后等待 300ms,
         若有数据帧到达则判定为面板流模式 (此模式下 RS-232 指令不可用)。
+
+        注意: 设备不支持硬件握手, 打开串口后立即拉低 DTR/RTS,
+        避免 CH340 等 USB 转串口芯片的 DTR 跳变导致设备复位。
         """
         if serial is None:
             raise RuntimeError("pyserial is not installed")
@@ -158,7 +161,13 @@ class CH1600Driver:
             parity=parity,
             stopbits=stopbits,
             timeout=0.05,
+            dsrdtr=False,
+            rtscts=False,
+            xonxoff=False,
         )
+        # 拉低 DTR/RTS, 防止 Windows 默认拉高导致设备复位
+        self._serial.dtr = False
+        self._serial.rts = False
         try:
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
@@ -185,7 +194,8 @@ class CH1600Driver:
                 self._cached_temp_c = frame["temp_c"]
                 return f"CH-1600@{port} (面板实时发送模式, 指令不可用)"
 
-        # 正常模式: 发送 UNIT?> 查询设备身份
+        # 正常模式: 优先发送 UNIT?> 查询设备身份；部分 CH-1600 固件不响应
+        # UNIT?>，此时退回到原厂软件使用的 DATA?> 短采样帧验证。
         try:
             unit = self.query_unit()
             if unit.startswith("#"):
@@ -194,8 +204,25 @@ class CH1600Driver:
             elif unit in {"mT", "Gauss", "A/m", "Oe", "oe"}:
                 idn = f"CH-1600@{port} (unit={unit})"
             else:
-                raise RuntimeError(f"未识别的 UNIT?> 响应: {unit!r}")
+                frame = self._probe_data_stream()
+                if frame is None:
+                    raise RuntimeError(f"未识别的 UNIT?> 响应: {unit!r}")
+                self._cached_field_mt = frame["field_mt"]
+                self._cached_freq_hz = frame["freq_hz"]
+                self._cached_temp_c = frame["temp_c"]
+                idn = f"CH-1600@{port} (DATA?> verified)"
         except Exception as exc:
+            frame = None
+            if "未识别的 UNIT?>" not in str(exc):
+                try:
+                    frame = self._probe_data_stream()
+                except Exception:
+                    frame = None
+            if frame is not None:
+                self._cached_field_mt = frame["field_mt"]
+                self._cached_freq_hz = frame["freq_hz"]
+                self._cached_temp_c = frame["temp_c"]
+                return f"CH-1600@{port} (DATA?> verified)"
             try:
                 self.close()
             finally:
@@ -203,13 +230,48 @@ class CH1600Driver:
 
         return idn
 
+    def _probe_data_stream(self, duration_s: float = 1.2) -> Optional[Dict[str, float]]:
+        """用原厂 DATA?> 短采样验证设备身份，并确保最后发送 DATAC> 停止。
+
+        有些 CH-1600 固件不响应 UNIT?>，但会响应 DATA?>。GUI 连接阶段
+        需要一个不依赖 UNIT?> 的验证路径，否则真实设备会被误判为未连接。
+        """
+        with self._lock:
+            if self._serial is None or not self._serial.is_open:
+                return None
+            data = b""
+            try:
+                self._serial.reset_input_buffer()
+                self._serial.write(b"DATAC>")
+                _time.sleep(0.2)
+                self._read_available()
+
+                self._serial.write(b"DATA?>")
+                deadline = _time.monotonic() + duration_s
+                while _time.monotonic() < deadline:
+                    chunk = self._read_available()
+                    if chunk:
+                        data += chunk
+                        frame = CH1600Driver.parse_first_stream_frame(data)
+                        if frame is not None:
+                            return frame
+                    _time.sleep(0.03)
+                return None
+            finally:
+                try:
+                    self._serial.write(b"DATAC>")
+                    _time.sleep(0.1)
+                    self._read_available()
+                except Exception:
+                    pass
+
     def close(self) -> None:
         """关闭串口，先停止数据流。"""
         with self._lock:
             if self._serial is not None:
                 try:
                     if self._streaming:
-                        self._send_raw(b"DATAC>\r")
+                        self._send_raw(b"DATAC>")
                         self._streaming = False
                 except Exception:
                     pass
@@ -230,7 +292,9 @@ class CH1600Driver:
     ) -> List[Tuple[str, str]]:
         """扫描所有串口，识别 CH-1600 设备。
 
-        策略: 打开每个端口，发送 UNIT?>，检查响应是否为已知单位字符串。
+        策略:
+        1. 打开端口后先静默观察 ~0.4s，若收到自动数据帧则判定为面板实时发送模式。
+        2. 否则发送 UNIT?>，检查响应是否包含已知单位字符串（兼容响应与数据帧粘连的情况）。
         """
         if serial is None:
             raise RuntimeError("pyserial is not installed")
@@ -248,13 +312,66 @@ class CH1600Driver:
                     parity="N",
                     stopbits=1,
                     timeout=timeout,
+                    dsrdtr=False,
+                    rtscts=False,
+                    xonxoff=False,
                 ) as s:
+                    # 拉低 DTR/RTS, 防止 Windows 默认拉高导致设备复位
+                    s.dtr = False
+                    s.rts = False
                     s.reset_input_buffer()
                     s.reset_output_buffer()
-                    s.write(b"UNIT?>\r")
+
+                    # 步骤1: 静默观察面板实时发送模式
+                    _time.sleep(0.4)
+                    preview = b""
+                    n = s.in_waiting
+                    if n:
+                        preview = s.read(n)
+                    frame = CH1600Driver.parse_first_stream_frame(preview)
+                    if frame is not None:
+                        results.append((port, "CH-1600 [面板实时发送模式 / Panel Streaming]"))
+                        continue
+
+                    # 步骤2: 发送 UNIT?> 验证
+                    s.write(b"UNIT?>")
                     resp = s.read_until(b"\n").decode("ascii", errors="ignore").strip()
+                    # 精确匹配或前缀匹配（处理响应与数据帧粘连，如 "mT #-0003.5144/..."）
+                    matched_unit = None
                     if resp in valid_units:
-                        results.append((port, f"CH-1600 [unit={resp}]"))
+                        matched_unit = resp
+                    else:
+                        for unit in valid_units:
+                            if resp.startswith(unit) or (" " in resp and resp.split()[0] == unit):
+                                matched_unit = unit
+                                break
+                    if matched_unit:
+                        results.append((port, f"CH-1600 [unit={matched_unit}]"))
+                        continue
+
+                    # 步骤3: 部分固件不响应 UNIT?>，使用 DATA?> 短采样兜底。
+                    try:
+                        s.reset_input_buffer()
+                        s.write(b"DATAC>")
+                        _time.sleep(0.2)
+                        if s.in_waiting:
+                            s.read(s.in_waiting)
+                        s.write(b"DATA?>")
+                        data = b""
+                        deadline = _time.monotonic() + 1.2
+                        while _time.monotonic() < deadline:
+                            n = s.in_waiting
+                            if n:
+                                data += s.read(n)
+                                if CH1600Driver.parse_first_stream_frame(data) is not None:
+                                    results.append((port, "CH-1600 [DATA?> verified]"))
+                                    break
+                            _time.sleep(0.03)
+                    finally:
+                        try:
+                            s.write(b"DATAC>")
+                        except Exception:
+                            pass
             except Exception:
                 pass
         return results
@@ -287,7 +404,7 @@ class CH1600Driver:
     def _send_command(self, cmd: str) -> bytes:
         """发送命令并读取响应。
 
-        命令以 CR (0x0D) 结尾。先发送命令, 等待设备处理,
+        原厂程序直接发送命令文本，不追加 CR/LF。先发送命令，等待设备处理，
         然后读取所有可用字节作为响应。
         兼容有/无 \\n 终止符的响应格式。
         """
@@ -299,7 +416,7 @@ class CH1600Driver:
                 raise ValueError("empty CH-1600 command")
             if not clean_cmd.endswith(">"):
                 clean_cmd += ">"
-            tx = (clean_cmd + "\r").encode("ascii")
+            tx = clean_cmd.encode("ascii")
             self._serial.write(tx)
             if self._raw_log_cb:
                 try:
@@ -414,8 +531,23 @@ class CH1600Driver:
                     }
             if not text.startswith("#"):
                 return None
+            if not text.endswith(">"):
+                return None
             core = text[1:].rstrip(">").strip()
             parts = core.split("/")
+            if len(parts) == 1:
+                # 原厂高速 FAST2>/FASTxxx> 数据帧只有磁场值:
+                # #+0000.1496>
+                field_x = float(parts[0])
+                return {
+                    "field_x_mt": field_x,
+                    "field_y_mt": 0.0,
+                    "field_z_mt": 0.0,
+                    "field_total_mt": field_x,
+                    "freq_hz": 0.0,
+                    "temp_c": 0.0,
+                    "field_mt": field_x,
+                }
             if len(parts) != 3:
                 return None
             field_x = float(parts[0])
@@ -606,11 +738,9 @@ class CH1600Driver:
             model: 设备型号。若为一维高斯计 ("1d_gauss") 且模式使用 FAST020>，
                    则自动替换为简写 FAST2>。
         """
-        if self._panel_streaming_mode:
-            # 面板模式: 设备已在发送数据, 直接开始读取
-            with self._lock:
-                self._streaming = True
-            return
+        # A detected preview stream can also be a leftover remote FAST/DATA
+        # stream. Do not skip the requested start command merely because it was
+        # labelled as panel/preview streaming during connect.
 
         # 根据模式选择启动指令
         from app.config_io import ACQ_MODE_TABLE
@@ -646,11 +776,8 @@ class CH1600Driver:
 
     def stop_streaming(self) -> None:
         """停止实时数据流 (DATAC> 或仅标记停止)。"""
-        if self._panel_streaming_mode:
-            # 面板模式: 不发送 DATAC> (会被忽略), 仅标记停止
-            with self._lock:
-                self._streaming = False
-            return
+        # Always try DATAC>; a preview stream may be a remote stream left by
+        # the previous GUI/debug session, not a truly command-locked panel mode.
         try:
             self._send_command("DATAC")
         except Exception:
