@@ -95,9 +95,16 @@ class TestGUISmoke(unittest.TestCase):
                 self.assertEqual(window._probe_profile, "weak_field")
                 self.assertEqual(window._live_tabs.count(), 3)
                 self.assertEqual(window._review_main_tabs.count(), 4)
+                if _HAS_PYG:
+                    self.assertGreaterEqual(window._review_plot_tabs.count(), 4)
+                    self.assertIsNotNone(window._review_spectrum_curve)
+                    self.assertIsNotNone(window._review_cursor_a)
+                    self.assertIsNotNone(window._live_cursor_a)
+                    self.assertIn("current", window._live_metric_labels)
                 self.assertIn("筛选统计", window._review_main_tabs.tabText(1))
                 self.assertIn("数据表", window._review_main_tabs.tabText(3))
                 self.assertEqual(window._data_table.verticalScrollBarPolicy(), Qt.ScrollBarAlwaysOn)
+                self.assertIs(window._data_table.model(), window._live_table_model)
                 self.assertEqual(window._review_table.verticalScrollBarPolicy(), Qt.ScrollBarAlwaysOn)
                 self.assertIn("Apply Filter", window._review_apply_filter_btn.text())
                 self.assertIn("刷新图表", window._review_apply_filter_btn.toolTip())
@@ -174,19 +181,22 @@ class TestGUISmoke(unittest.TestCase):
             window = GaussMeterGUI()
             try:
                 window._set_review_data(records, files=[])
-                self.assertGreaterEqual(window._review_plot_tabs.count(), 3)
+                self.assertGreaterEqual(window._review_plot_tabs.count(), 4)
                 window._review_plot_tabs.setCurrentIndex(1)
+                window._update_review_plot()
+                self.assertIn("Hz", window._review_spectrum_status.text())
+                window._review_plot_tabs.setCurrentIndex(2)
                 window._update_review_plot()
                 self.assertIn("2 × 2", window._review_heatmap_status.text())
                 self.assertTrue(np.isfinite(window._review_heatmap_item.image).all())
-                window._review_plot_tabs.setCurrentIndex(2)
+                window._review_plot_tabs.setCurrentIndex(3)
                 window._update_review_plot()
                 if _HAS_PYG_GL and window._review_surface_widget is not None:
                     self.assertIsNotNone(window._review_surface_item)
                 else:
                     self.assertRegex(window._review_surface_status.text(), "PyOpenGL|OpenGL")
                 self.assertGreaterEqual(window._review_heatmap_channel_combo.count(), 1)
-                window._review_plot_tabs.setCurrentIndex(1)
+                window._review_plot_tabs.setCurrentIndex(2)
                 window._review_heatmap_auto_levels_cb.setChecked(False)
                 window._review_heatmap_min_edit.setText("0")
                 window._review_heatmap_max_edit.setText("5")
@@ -242,6 +252,158 @@ class TestGUISmoke(unittest.TestCase):
                 self.assertAlmostEqual(corrected["field_total_mt"], 7.0)
                 self.assertAlmostEqual(corrected["field_mt"], 7.0)
                 self.assertIn("X:", window._zero_offset_label.text())
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    def test_live_table_model_and_trigger_capture(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            try:
+                window._trigger_enabled_cb.setChecked(True)
+                window._trigger_mode_combo.setCurrentIndex(
+                    window._trigger_mode_combo.findData("rising")
+                )
+                window._trigger_level_edit.setText("1.0")
+                window._trigger_pre_spin.setValue(1)
+                window._trigger_post_spin.setValue(1)
+                window._on_stream_batch({
+                    "points": [
+                        {"timestamp_s": 0.0, "field_mt": 0.0, "field_total_mt": 0.0},
+                        {"timestamp_s": 0.1, "field_mt": 1.5, "field_total_mt": 1.5},
+                        {"timestamp_s": 0.2, "field_mt": 1.4, "field_total_mt": 1.4},
+                    ]
+                })
+                window._flush_live_table_rows()
+                self.assertEqual(window._live_table_model.rowCount(), 3)
+                self.assertEqual(len(window._trigger_events), 1)
+                self.assertGreaterEqual(len(window._trigger_events[0]["window_points"]), 3)
+                self.assertIn("事件 1", window._trigger_status_label.text())
+
+                window._trigger_single_cb.setChecked(True)
+                window._arm_trigger()
+                window._on_stream_batch({
+                    "points": [
+                        {"timestamp_s": 0.2, "field_mt": 0.0, "field_total_mt": 0.0},
+                        {"timestamp_s": 0.3, "field_mt": 2.0, "field_total_mt": 2.0},
+                        {"timestamp_s": 0.4, "field_mt": 2.1, "field_total_mt": 2.1},
+                    ]
+                })
+                self.assertFalse(window._trigger_armed)
+                self.assertEqual(len(window._trigger_events), 2)
+                self.assertGreaterEqual(window._trigger_event_table.rowCount(), 2)
+                window._replay_last_trigger_event()
+                self.assertTrue(window._display_paused)
+                window._on_clear_data_table()
+                self.assertEqual(window._live_table_model.rowCount(), 0)
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    def test_threshold_trigger_captures_only_ng_entry(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            try:
+                window._trigger_max_events = 2
+                window._trigger_enabled_cb.setChecked(True)
+                window._trigger_mode_combo.setCurrentIndex(
+                    window._trigger_mode_combo.findData("threshold")
+                )
+                window._low_thresh_edit.setText("0.0")
+                window._up_thresh_edit.setText("1.0")
+                window._trigger_pre_spin.setValue(0)
+                window._trigger_post_spin.setValue(0)
+
+                window._on_stream_batch({
+                    "points": [
+                        {"timestamp_s": 0.0, "field_mt": 2.0, "field_total_mt": 2.0},
+                        {"timestamp_s": 0.1, "field_mt": 2.1, "field_total_mt": 2.1},
+                        {"timestamp_s": 0.2, "field_mt": 2.2, "field_total_mt": 2.2},
+                    ]
+                })
+                self.assertEqual(len(window._trigger_events), 1)
+                first_id = window._trigger_events[-1]["id"]
+
+                window._on_stream_batch({
+                    "points": [
+                        {"timestamp_s": 0.3, "field_mt": 0.5, "field_total_mt": 0.5},
+                        {"timestamp_s": 0.4, "field_mt": 2.3, "field_total_mt": 2.3},
+                        {"timestamp_s": 0.5, "field_mt": 0.6, "field_total_mt": 0.6},
+                        {"timestamp_s": 0.6, "field_mt": 2.4, "field_total_mt": 2.4},
+                    ]
+                })
+                self.assertEqual(len(window._trigger_events), 2)
+                self.assertGreater(window._trigger_events[-1]["id"], first_id)
+                self.assertEqual(
+                    [event["id"] for event in window._trigger_events],
+                    [2, 3],
+                )
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    def test_live_threshold_metrics_follow_selected_channel(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        cfg["device_model"] = "2d_gauss"
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            try:
+                idx = window._judge_channel_combo.findData("field_x")
+                self.assertGreaterEqual(idx, 0)
+                window._judge_channel_combo.setCurrentIndex(idx)
+                window._low_thresh_edit.setText("0.0")
+                window._up_thresh_edit.setText("1.0")
+                timestamps = [0.0, 0.1, 0.2]
+                window._buffer.extend(
+                    {
+                        "field_x_mt": [0.5, 2.0, 0.4],
+                        "field_y_mt": [0.0, 0.0, 0.0],
+                        "field_total_mt": [0.5, 0.5, 0.5],
+                        "freq_hz": [0.0, 0.0, 0.0],
+                        "temp_c": [25.0, 25.0, 25.0],
+                    },
+                    timestamps,
+                )
+                window._update_live_measurements(
+                    np.asarray(timestamps),
+                    np.asarray([0.5, 0.5, 0.5]),
+                    "field_total_mt",
+                )
+                self.assertIn("NG 1 / 1", window._live_metric_labels["threshold"].text())
+            finally:
+                window.close()
+        self.assertIsNotNone(app)
+
+    @unittest.skipUnless(_HAS_PYG, "pyqtgraph is not installed")
+    def test_live_sample_rate_uses_raw_points_not_plot_downsample(self):
+        app = QApplication.instance() or QApplication([])
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["database"]["enabled"] = False
+        with patch("app.gui.load_config", return_value=cfg), patch("app.gui.save_config"):
+            window = GaussMeterGUI()
+            try:
+                idx = window._sample_rate_combo.findData("dc_200hz")
+                self.assertGreaterEqual(idx, 0)
+                window._sample_rate_combo.setCurrentIndex(idx)
+                timestamps = [i * 0.1 for i in range(12)]
+                window._buffer.extend(
+                    {
+                        "field_mt": [float(i) for i in range(12)],
+                        "freq_hz": [0.0] * 12,
+                        "temp_c": [25.0] * 12,
+                    },
+                    timestamps,
+                )
+                window._on_display_tick()
+                self.assertIn("10", window._live_metric_labels["sample_rate_hz"].text())
             finally:
                 window.close()
         self.assertIsNotNone(app)

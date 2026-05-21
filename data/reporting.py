@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from data.review_loader import get_review_summary, primary_field_name
+from data.measurement_analysis import analyze_threshold_events
 from data.spatial import build_heatmap_grid, build_interpolated_heatmap_grid
+from data.spatial_analysis import analyze_spatial_grid, extract_profile
 
 
 def _line_svg(arr: np.ndarray, width: int = 900, height: int = 260) -> str:
@@ -120,6 +122,73 @@ def _threshold_table(threshold: Optional[Dict[str, Any]]) -> str:
         ("NG 点数", threshold.get("ng_count", "")),
     ]
     return "<table>" + "\n".join(
+        f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
+        for k, v in rows
+    ) + "</table>"
+
+
+def _advanced_summary_rows(summary: Dict[str, Any]) -> str:
+    rows = [
+        ("磁场 RMS", f"{summary.get('field_rms', 0.0):.9g} {summary.get('field_unit', '')}"),
+        ("磁场标准差", f"{summary.get('field_std', 0.0):.9g} {summary.get('field_unit', '')}"),
+        ("峰峰值", f"{summary.get('field_peak_to_peak', 0.0):.9g} {summary.get('field_unit', '')}"),
+        ("估算采样率", f"{summary.get('sample_rate_hz', 0.0):.9g} Hz"),
+    ]
+    return "\n".join(
+        f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
+        for k, v in rows
+    )
+
+
+def _threshold_event_rows(arr: np.ndarray, threshold: Optional[Dict[str, Any]]) -> str:
+    if not threshold or not threshold.get("enabled") or arr is None or len(arr) == 0:
+        return ""
+    channel = str(threshold.get("channel") or primary_field_name(arr))
+    if channel not in (arr.dtype.names or ()):
+        channel = primary_field_name(arr)
+    events = analyze_threshold_events(
+        arr["timestamp_s"],
+        arr[channel],
+        low=float(threshold.get("low", 0.0)),
+        high=float(threshold.get("high", 0.0)),
+        absolute=bool(threshold.get("absolute", False)),
+        mode=str(threshold.get("mode", "closed")),
+    )
+    if not events.get("enabled"):
+        return ""
+    rows = [
+        ("超限点数", events.get("ng_count", 0)),
+        ("超限事件数", events.get("event_count", 0)),
+        ("超限占比", f"{float(events.get('ng_ratio', 0.0)) * 100.0:.4g}%"),
+        ("最长超限区间", f"{events.get('longest_event_s', 0.0):.6g} s"),
+    ]
+    return "<h2>阈值事件摘要</h2><table>" + "\n".join(
+        f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
+        for k, v in rows
+    ) + "</table>"
+
+
+def _spatial_summary_table(arr: np.ndarray, value_key: str | None = None) -> str:
+    try:
+        xs, ys, grid = build_interpolated_heatmap_grid(arr, value_key=value_key, resolution=80)
+    except ValueError:
+        return ""
+    stats = analyze_spatial_grid(xs, ys, grid)
+    profile = extract_profile(xs, ys, grid, axis="x")
+    rows = [
+        ("有效格点", stats["count"]),
+        ("区域最小值", f"{stats['min']:.9g}"),
+        ("区域最大值", f"{stats['max']:.9g}"),
+        ("区域平均值", f"{stats['mean']:.9g}"),
+        ("区域标准差", f"{stats['std']:.9g}"),
+        ("均匀性 pk-pk/mean", f"{stats['uniformity_pct']:.6g}%"),
+        ("最大梯度", f"{stats['gradient_max']:.9g}"),
+        ("热点坐标", f"X={stats['hotspot'][0]:.6g}, Y={stats['hotspot'][1]:.6g}, V={stats['hotspot'][2]:.9g}"),
+        ("冷点坐标", f"X={stats['coldspot'][0]:.6g}, Y={stats['coldspot'][1]:.6g}, V={stats['coldspot'][2]:.9g}"),
+    ]
+    if profile.get("ok"):
+        rows.append(("中心剖面峰峰值", f"{profile['peak_to_peak']:.9g}"))
+    return "<h2>空间扫描摘要</h2><table>" + "\n".join(
         f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
         for k, v in rows
     ) + "</table>"
@@ -256,6 +325,7 @@ def export_html_report(
         heatmap_section = f"""
   <h2>空间热图</h2>
   <div class="chart">{heatmap_fragment}</div>
+  {_spatial_summary_table(arr, heatmap_value_key)}
 """
     body = f"""<!doctype html>
 <html lang="zh-CN">
@@ -280,9 +350,11 @@ def export_html_report(
     <tr><th>磁场最小值</th><td>{summary['field_min']:.9g} {html.escape(summary.get('field_unit', ''))}</td></tr>
     <tr><th>磁场最大值</th><td>{summary['field_max']:.9g} {html.escape(summary.get('field_unit', ''))}</td></tr>
     <tr><th>磁场平均值</th><td>{summary['field_mean']:.9g} {html.escape(summary.get('field_unit', ''))}</td></tr>
+    {_advanced_summary_rows(summary)}
   </table>
   <h2>阈值判定</h2>
   {_threshold_table(threshold)}
+  {_threshold_event_rows(arr, threshold)}
   <h2>测量曲线</h2>
   <div class="chart">{_line_svg(arr)}</div>
   {heatmap_section}

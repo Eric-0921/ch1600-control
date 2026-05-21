@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from data.measurement_analysis import analyze_time_series
+
 
 REVIEW_DTYPE: List[Tuple[str, str]] = [
     ("session_id", "i8"),
@@ -361,13 +363,19 @@ def get_review_summary(arr: np.ndarray) -> dict:
     for ch in ("field_x", "field_y", "field_z", "field_total", "freq_hz", "temp_c"):
         if ch in (arr.dtype.names or ()):
             channels[ch] = _safe_channel_stats(arr, ch)
+            channels[ch].update(analyze_time_series(ts, arr[ch]))
+    field_analysis = analyze_time_series(ts, field)
     units = [str(u) for u in np.unique(arr["field_unit"]) if str(u)]
     return {
         "count": int(arr.size),
-        "duration_s": float(ts[-1] - ts[0]) if arr.size > 1 else 0.0,
+        "duration_s": field_analysis["duration_s"],
         "field_min": float(np.nanmin(field)),
         "field_max": float(np.nanmax(field)),
         "field_mean": float(np.nanmean(field)),
+        "field_std": field_analysis["std"],
+        "field_rms": field_analysis["rms"],
+        "field_peak_to_peak": field_analysis["peak_to_peak"],
+        "sample_rate_hz": field_analysis["sample_rate_hz"],
         "field_unit": units[0] if len(units) == 1 else "/".join(units[:3]),
         "channels": channels,
     }

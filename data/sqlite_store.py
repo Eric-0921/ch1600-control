@@ -7,6 +7,7 @@ samples, raw serial frames, and export provenance for review/query workflows.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -17,7 +18,7 @@ from data.device_capabilities import get_device_capability, normalize_sample_by_
 from data.review_loader import records_to_review_array
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_SOURCES = {"realtime", "import_csv", "import_txt", "device_memory"}
 
 
@@ -134,6 +135,26 @@ class CH1600SQLiteStore:
             cur.execute("ALTER TABLE sessions ADD COLUMN probe_profile TEXT NOT NULL DEFAULT 'standard_hall'")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS trigger_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                timestamp_s REAL NOT NULL,
+                sequence INTEGER,
+                channel TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                level REAL,
+                value REAL NOT NULL,
+                pre_points INTEGER NOT NULL DEFAULT 0,
+                post_points INTEGER NOT NULL DEFAULT 0,
+                window_json TEXT,
+                notes TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trigger_events_session_time ON trigger_events(session_id, timestamp_s)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS exports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
@@ -151,6 +172,52 @@ class CH1600SQLiteStore:
             (str(SCHEMA_VERSION),),
         )
         self._conn.commit()
+
+    def append_trigger_event(
+        self,
+        *,
+        session_id: Optional[int],
+        timestamp_s: float,
+        value: float,
+        channel: str,
+        mode: str,
+        sequence: Optional[int] = None,
+        level: Optional[float] = None,
+        pre_points: int = 0,
+        post_points: int = 0,
+        window_points: Optional[List[Dict[str, Any]]] = None,
+        notes: str = "",
+    ) -> int:
+        """Persist one trigger event with an optional compact replay window."""
+        window_json = json.dumps(window_points or [], ensure_ascii=False, separators=(",", ":"))
+        cur = self._conn.execute(
+            """
+            INSERT INTO trigger_events (
+                session_id, created_at, timestamp_s, sequence, channel, mode, level, value,
+                pre_points, post_points, window_json, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id, _utc_now(), float(timestamp_s), sequence, channel, mode, level,
+                float(value), int(pre_points), int(post_points), window_json, notes,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def list_trigger_events(self, session_id: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return recent trigger events for review/debugging."""
+        if session_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM trigger_events ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trigger_events WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def create_session(
         self,

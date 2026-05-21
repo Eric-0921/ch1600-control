@@ -18,13 +18,13 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMenuBar, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem,
+    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QTableView, QTableWidget, QTableWidgetItem,
     QTextEdit, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -35,6 +35,10 @@ from data.device_capabilities import (
     get_device_capability, get_probe_profile, iter_device_capabilities,
     iter_probe_profiles, normalize_sample_by_capability,
 )
+from data.measurement_analysis import (
+    analyze_spectrum, analyze_threshold_events, analyze_time_series,
+    analyze_vector_components,
+)
 from data.recorder import CH1600Recorder
 from data.reporting import evaluate_threshold, export_html_report
 from data.review_loader import (
@@ -42,6 +46,7 @@ from data.review_loader import (
     load_review_files, merge_review_arrays, primary_field_name,
 )
 from data.spatial import build_heatmap_grid, build_interpolated_heatmap_grid, build_surface_grid
+from data.spatial_analysis import analyze_spatial_grid, extract_profile
 from data.sqlite_store import CH1600SQLiteStore
 from core.command_service import CommandService
 from core.commands import Command, CommandType
@@ -56,6 +61,60 @@ except ImportError:
     _HAS_PYG = False
 
 _HAS_PYG_GL = SurfaceRenderer.is_available()
+
+
+class LiveTableModel(QAbstractTableModel):
+    """实时数据虚拟表格模型，避免高频场景逐行创建 QTableWidgetItem。"""
+
+    def __init__(self, columns: List[str]) -> None:
+        super().__init__()
+        self._columns = list(columns)
+        self._rows: List[List[str]] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid() or role != Qt.DisplayRole:
+            return None
+        try:
+            return self._rows[index.row()][index.column()]
+        except IndexError:
+            return None
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            if 0 <= section < len(self._columns):
+                return self._columns[section]
+            return None
+        return str(section + 1)
+
+    def set_columns(self, columns: List[str]) -> None:
+        self.beginResetModel()
+        self._columns = list(columns)
+        self._rows = []
+        self.endResetModel()
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._rows = []
+        self.endResetModel()
+
+    def append_rows(self, rows: List[List[str]], max_rows: int) -> None:
+        if not rows:
+            return
+        merged = self._rows + rows
+        if len(merged) > max_rows:
+            merged = merged[-max_rows:]
+        self.beginResetModel()
+        self._rows = merged
+        self.endResetModel()
+
 
 # ------------------------------------------------------------------
 # Siemens 工业风样式表 (复用 odmr-control)
@@ -231,6 +290,18 @@ class GaussMeterGUI(QMainWindow):
         self._review_file_paths: List[Path] = []
         self._review_table_updating = False
         self._pending_live_table_rows: List[List[str]] = []
+        self._live_table_model = LiveTableModel(list(get_device_capability(self._device_model).table_columns))
+
+        # 示波器式触发/事件捕获状态
+        trigger_cfg = self._cfg.get("trigger", {})
+        self._trigger_events: List[Dict[str, Any]] = []
+        self._trigger_prev_value: Optional[float] = None
+        self._trigger_prev_threshold_ng: Optional[bool] = None
+        self._trigger_next_event_id = 1
+        self._trigger_armed = True
+        self._trigger_max_events = int(trigger_cfg.get("max_events", 100) or 100)
+        self._trigger_pre_points: List[Dict[str, float]] = []
+        self._trigger_pending_events: List[Dict[str, Any]] = []
 
         # 软件零点偏移 (仅主线程读写, 无需加锁)。保留 legacy scalar，新增分量级 offset。
         acq_cfg = self._cfg.get("acquisition", {})
@@ -271,6 +342,9 @@ class GaussMeterGUI(QMainWindow):
         self._chart_auto_y = True
         self._chart_y_min = -1.0
         self._chart_y_max = 1.0
+        self._live_cursor_data: Tuple[np.ndarray, np.ndarray] = (np.array([]), np.array([]))
+        self._review_cursor_data: Tuple[np.ndarray, np.ndarray] = (np.array([]), np.array([]))
+        self._last_live_analysis: Dict[str, Dict[str, float]] = {}
 
         # FPS 跟踪
         self._display_fps = 0.0
@@ -653,7 +727,8 @@ class GaussMeterGUI(QMainWindow):
             "<b>▶ 实时发送 (Realtime Transmit) 模式：</b><br>"
             "  按 <b>[Menu]</b> → 选择 <b>Realtime Transmit</b> → 按 Enter →<br>"
             "  设备开始持续串口发送数据帧，此时 <b>RS-232 指令不可用</b>。<br>"
-            "  <i>要恢复指令控制：在设备面板按 Enter 退出实时发送模式。</i>"
+            "  <i>要恢复指令控制：在设备面板按 Enter 退出实时发送模式。</i><br>"
+            "  <b>设备人工超控：</b>menu-urat-连续按enter切换回指令模式"
         )
         guide_text.setWordWrap(True)
         guide_text.setStyleSheet("font-size: 11px; color: #555;")
@@ -915,6 +990,87 @@ class GaussMeterGUI(QMainWindow):
         ctrl_status_row.addWidget(self._live_stats)
         layout.addLayout(ctrl_status_row)
 
+        measure_grp = QGroupBox("测量指标 / Measurements")
+        measure_grid = QGridLayout(measure_grp)
+        measure_grid.setHorizontalSpacing(14)
+        measure_grid.setVerticalSpacing(6)
+        self._live_metric_labels: Dict[str, QLabel] = {}
+        metric_defs = [
+            ("current", "当前 / Current"),
+            ("min", "Min"),
+            ("max", "Max"),
+            ("peak_to_peak", "Pk-Pk"),
+            ("rms", "RMS"),
+            ("std", "Std"),
+            ("sample_rate_hz", "实际采样率 / Sample Rate"),
+            ("duration_s", "窗口时长 / Duration"),
+            ("threshold", "阈值事件 / Threshold"),
+            ("vector", "矢量方向 / Vector"),
+        ]
+        for idx, (key, label_text) in enumerate(metric_defs):
+            row = idx // 5
+            col = (idx % 5) * 2
+            measure_grid.addWidget(QLabel(label_text + ":"), row, col)
+            value = QLabel("--")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value.setMinimumWidth(110)
+            self._live_metric_labels[key] = value
+            measure_grid.addWidget(value, row, col + 1)
+        layout.addWidget(measure_grp)
+
+        trigger_grp = QGroupBox("触发捕获 / Trigger Capture")
+        trigger_grid = QGridLayout(trigger_grp)
+        self._trigger_enabled_cb = QCheckBox("启用 / Enable")
+        self._trigger_enabled_cb.toggled.connect(self._on_trigger_enabled_changed)
+        trigger_grid.addWidget(self._trigger_enabled_cb, 0, 0)
+        self._trigger_mode_combo = QComboBox()
+        self._trigger_mode_combo.addItem("阈值超限 / Threshold NG", "threshold")
+        self._trigger_mode_combo.addItem("上升沿 / Rising Edge", "rising")
+        self._trigger_mode_combo.addItem("下降沿 / Falling Edge", "falling")
+        trigger_grid.addWidget(self._trigger_mode_combo, 0, 1)
+        trigger_grid.addWidget(QLabel("电平 / Level:"), 0, 2)
+        self._trigger_level_edit = QLineEdit(str(self._cfg.get("trigger", {}).get("level", 0.0)))
+        self._trigger_level_edit.setValidator(QDoubleValidator())
+        self._trigger_level_edit.setFixedWidth(90)
+        trigger_grid.addWidget(self._trigger_level_edit, 0, 3)
+        trigger_grid.addWidget(QLabel("Pre/Post:"), 0, 4)
+        self._trigger_pre_spin = QSpinBox()
+        self._trigger_pre_spin.setRange(0, 5000)
+        self._trigger_pre_spin.setValue(int(self._cfg.get("trigger", {}).get("pre_points", 50) or 50))
+        self._trigger_pre_spin.setToolTip("每个事件保存的触发前点数")
+        trigger_grid.addWidget(self._trigger_pre_spin, 0, 5)
+        self._trigger_post_spin = QSpinBox()
+        self._trigger_post_spin.setRange(0, 5000)
+        self._trigger_post_spin.setValue(int(self._cfg.get("trigger", {}).get("post_points", 50) or 50))
+        self._trigger_post_spin.setToolTip("每个事件保存的触发后点数")
+        trigger_grid.addWidget(self._trigger_post_spin, 0, 6)
+        self._trigger_single_cb = QCheckBox("Single")
+        self._trigger_single_cb.setToolTip("触发一次后自动解除 armed 状态")
+        trigger_grid.addWidget(self._trigger_single_cb, 0, 7)
+        arm_btn = QPushButton("Arm")
+        arm_btn.clicked.connect(self._arm_trigger)
+        trigger_grid.addWidget(arm_btn, 0, 8)
+        clear_trig_btn = QPushButton("清空事件 / Clear Events")
+        clear_trig_btn.clicked.connect(self._clear_trigger_events)
+        trigger_grid.addWidget(clear_trig_btn, 0, 9)
+        replay_trig_btn = QPushButton("回放最后事件 / Replay Last")
+        replay_trig_btn.clicked.connect(self._replay_last_trigger_event)
+        trigger_grid.addWidget(replay_trig_btn, 0, 10)
+        self._trigger_status_label = QLabel("未启用 / Disabled")
+        self._trigger_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        trigger_grid.addWidget(self._trigger_status_label, 1, 0, 1, 11)
+        self._trigger_event_table = QTableWidget()
+        self._trigger_event_table.setColumnCount(6)
+        self._trigger_event_table.setHorizontalHeaderLabels(["#", "Time(s)", "Mode", "Value", "Window", "DB"])
+        self._trigger_event_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._trigger_event_table.setMaximumHeight(120)
+        self._trigger_event_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._trigger_event_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._trigger_event_table.itemSelectionChanged.connect(self._on_trigger_event_selected)
+        trigger_grid.addWidget(self._trigger_event_table, 2, 0, 1, 11)
+        trigger_grid.setColumnStretch(10, 1)
+        layout.addWidget(trigger_grp)
+
         self._live_tabs = QTabWidget()
         chart_page = QWidget()
         chart_layout = QVBoxLayout(chart_page)
@@ -976,6 +1132,35 @@ class GaussMeterGUI(QMainWindow):
                 pos=0, angle=0, pen=pg.mkPen("#c0c0c0", width=1, style=Qt.DashLine)
             )
             self._plot_widget.addItem(self._zero_line)
+            self._live_mean_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#ffaa00", width=1, style=Qt.DashLine)
+            )
+            self._live_mean_line.setVisible(False)
+            self._plot_widget.addItem(self._live_mean_line)
+            self._live_thresh_low_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#e04040", width=1, style=Qt.DotLine)
+            )
+            self._live_thresh_high_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#e04040", width=1, style=Qt.DotLine)
+            )
+            self._live_thresh_low_line.setVisible(False)
+            self._live_thresh_high_line.setVisible(False)
+            self._plot_widget.addItem(self._live_thresh_low_line)
+            self._plot_widget.addItem(self._live_thresh_high_line)
+            self._live_cursor_a = pg.InfiniteLine(pos=-1.0, angle=90, movable=True, pen=pg.mkPen("#f0a000", width=1))
+            self._live_cursor_b = pg.InfiniteLine(pos=0.0, angle=90, movable=True, pen=pg.mkPen("#f0a000", width=1))
+            self._live_cursor_a.sigPositionChanged.connect(self._update_live_cursor_readout)
+            self._live_cursor_b.sigPositionChanged.connect(self._update_live_cursor_readout)
+            self._live_cursor_a.setVisible(False)
+            self._live_cursor_b.setVisible(False)
+            self._plot_widget.addItem(self._live_cursor_a)
+            self._plot_widget.addItem(self._live_cursor_b)
+            self._live_cursor_label = pg.TextItem("", color="#f0a000", anchor=(0, 1))
+            self._live_cursor_label.setVisible(False)
+            self._plot_widget.addItem(self._live_cursor_label)
+            self._live_peak_labels = []
+            self._trigger_marker_item = pg.ScatterPlotItem(size=9, brush=pg.mkBrush("#e04040"), pen=pg.mkPen("#ffffff"))
+            self._plot_widget.addItem(self._trigger_marker_item)
 
             chart_layout.addWidget(self._plot_widget)
         else:
@@ -989,6 +1174,12 @@ class GaussMeterGUI(QMainWindow):
         self._show_freq_cb = QCheckBox("显示频率曲线 / Show Frequency")
         self._show_freq_cb.toggled.connect(self._on_toggle_freq_curve)
         chk_row.addWidget(self._show_freq_cb)
+        self._live_cursor_cb = QCheckBox("游标 / Cursors")
+        self._live_cursor_cb.toggled.connect(self._on_toggle_live_cursors)
+        chk_row.addWidget(self._live_cursor_cb)
+        self._live_peaks_cb = QCheckBox("峰谷标注 / Peaks")
+        self._live_peaks_cb.toggled.connect(lambda _checked: self._update_live_peak_markers())
+        chk_row.addWidget(self._live_peaks_cb)
         chk_row.addStretch()
         chart_layout.addLayout(chk_row)
 
@@ -1081,16 +1272,17 @@ class GaussMeterGUI(QMainWindow):
         table_grp = QGroupBox("实时数据表格 / Live Data Table")
         tv = QVBoxLayout(table_grp)
 
-        self._data_table = QTableWidget()
         columns = self._get_table_columns(self._device_model)
-        self._data_table.setColumnCount(len(columns))
-        self._data_table.setHorizontalHeaderLabels(columns)
+        self._live_table_model.set_columns(columns)
+        self._data_table = QTableView()
+        self._data_table.setModel(self._live_table_model)
         self._data_table.horizontalHeader().setStretchLastSection(True)
         self._data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._data_table.setMinimumHeight(360)
         self._data_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self._data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._data_table.setAlternatingRowColors(True)
+        self._data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         tv.addWidget(self._data_table)
 
         table_ctrl = QHBoxLayout()
@@ -1377,12 +1569,20 @@ class GaussMeterGUI(QMainWindow):
         self._review_stat_min = QLabel("--")
         self._review_stat_max = QLabel("--")
         self._review_stat_mean = QLabel("--")
+        self._review_stat_rms = QLabel("--")
+        self._review_stat_std = QLabel("--")
+        self._review_stat_pkpk = QLabel("--")
+        self._review_stat_sample_rate = QLabel("--")
         for value_label in (
             self._review_stat_count,
             self._review_stat_duration,
             self._review_stat_min,
             self._review_stat_max,
             self._review_stat_mean,
+            self._review_stat_rms,
+            self._review_stat_std,
+            self._review_stat_pkpk,
+            self._review_stat_sample_rate,
         ):
             value_label.setMinimumWidth(160)
             value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1399,11 +1599,16 @@ class GaussMeterGUI(QMainWindow):
 
         stats_layout.addWidget(QLabel("磁场平均值 / Field Mean:"), 2, 0)
         stats_layout.addWidget(self._review_stat_mean, 2, 1)
+        stats_layout.addWidget(QLabel("RMS / Std:"), 2, 2)
+        stats_layout.addWidget(self._review_stat_rms, 2, 3)
+        stats_layout.addWidget(QLabel("Pk-Pk / Sample Rate:"), 3, 0)
+        stats_layout.addWidget(self._review_stat_pkpk, 3, 1)
+        stats_layout.addWidget(self._review_stat_sample_rate, 3, 3)
 
         self._review_stat_channels = QLabel("")
         self._review_stat_channels.setWordWrap(True)
         self._review_stat_channels.setStyleSheet("font-size: 11px; color: #555;")
-        stats_layout.addWidget(self._review_stat_channels, 3, 0, 1, 4)
+        stats_layout.addWidget(self._review_stat_channels, 4, 0, 1, 4)
 
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
@@ -1445,6 +1650,22 @@ class GaussMeterGUI(QMainWindow):
             self._review_region.setZValue(-10)
             self._review_region.sigRegionChangeFinished.connect(self._on_review_region_changed)
             self._review_plot_widget.addItem(self._review_region)
+            self._review_mean_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#ffaa00", width=1, style=Qt.DashLine)
+            )
+            self._review_plot_widget.addItem(self._review_mean_line)
+            self._review_cursor_a = pg.InfiniteLine(pos=0.0, angle=90, movable=True, pen=pg.mkPen("#f0a000", width=1))
+            self._review_cursor_b = pg.InfiniteLine(pos=1.0, angle=90, movable=True, pen=pg.mkPen("#f0a000", width=1))
+            self._review_cursor_a.sigPositionChanged.connect(self._update_review_cursor_readout)
+            self._review_cursor_b.sigPositionChanged.connect(self._update_review_cursor_readout)
+            self._review_cursor_a.setVisible(False)
+            self._review_cursor_b.setVisible(False)
+            self._review_plot_widget.addItem(self._review_cursor_a)
+            self._review_plot_widget.addItem(self._review_cursor_b)
+            self._review_cursor_label = pg.TextItem("", color="#f0a000", anchor=(0, 1))
+            self._review_cursor_label.setVisible(False)
+            self._review_plot_widget.addItem(self._review_cursor_label)
+            self._review_peak_labels = []
 
             def _update_review_freq_view():
                 self._review_freq_vb.setGeometry(plot_item.vb.sceneBoundingRect())
@@ -1454,6 +1675,22 @@ class GaussMeterGUI(QMainWindow):
 
             time_plot_layout.addWidget(self._review_plot_widget)
             self._review_plot_tabs.addTab(time_plot_page, "时间曲线 / Time")
+
+            spectrum_page = QWidget()
+            spectrum_layout = QVBoxLayout(spectrum_page)
+            spectrum_layout.setContentsMargins(0, 0, 0, 0)
+            self._review_spectrum_status = QLabel("载入数据后显示频谱")
+            self._review_spectrum_status.setStyleSheet("color: #555; padding: 4px;")
+            spectrum_layout.addWidget(self._review_spectrum_status)
+            self._review_spectrum_widget = pg.PlotWidget()
+            self._review_spectrum_widget.setLabel("bottom", "频率", units="Hz")
+            self._review_spectrum_widget.setLabel("left", "幅值")
+            self._review_spectrum_widget.showGrid(x=True, y=True, alpha=0.25)
+            self._review_spectrum_curve = self._review_spectrum_widget.plot(
+                pen=pg.mkPen("#0080c8", width=1.2), name="Spectrum"
+            )
+            spectrum_layout.addWidget(self._review_spectrum_widget, 1)
+            self._review_plot_tabs.addTab(spectrum_page, "频谱 / Spectrum")
 
             heatmap_page = QWidget()
             heatmap_layout = QVBoxLayout(heatmap_page)
@@ -1573,6 +1810,14 @@ class GaussMeterGUI(QMainWindow):
         else:
             self._review_plot_widget = None
             self._review_region = None
+            self._review_mean_line = None
+            self._review_cursor_a = None
+            self._review_cursor_b = None
+            self._review_cursor_label = None
+            self._review_peak_labels = []
+            self._review_spectrum_status = None
+            self._review_spectrum_widget = None
+            self._review_spectrum_curve = None
             self._review_heatmap_widget = None
             self._review_heatmap_item = None
             self._review_heatmap_lut = None
@@ -1614,6 +1859,12 @@ class GaussMeterGUI(QMainWindow):
         self._review_show_freq_cb = QCheckBox("显示频率曲线 / Show Frequency")
         self._review_show_freq_cb.toggled.connect(self._update_review_plot)
         ctrl_row.addWidget(self._review_show_freq_cb)
+        self._review_cursor_cb = QCheckBox("游标 / Cursors")
+        self._review_cursor_cb.toggled.connect(self._on_toggle_review_cursors)
+        ctrl_row.addWidget(self._review_cursor_cb)
+        self._review_peaks_cb = QCheckBox("峰谷标注 / Peaks")
+        self._review_peaks_cb.toggled.connect(lambda _checked: self._update_review_peak_markers())
+        ctrl_row.addWidget(self._review_peaks_cb)
         ctrl_row.addStretch()
         plot_tab_layout.addLayout(ctrl_row)
 
@@ -1778,14 +2029,20 @@ class GaussMeterGUI(QMainWindow):
         if data is None or len(data) == 0:
             self._review_field_curve.clear()
             self._review_freq_curve.clear()
+            if self._review_spectrum_curve is not None:
+                self._review_spectrum_curve.clear()
+            if self._review_spectrum_status is not None:
+                self._review_spectrum_status.setText("载入数据后显示频谱")
             self._update_review_heatmap(None)
             self._update_review_surface(None)
             return
 
         active_tab = self._review_plot_tabs.currentIndex() if hasattr(self, "_review_plot_tabs") else 0
         if active_tab == 1:
-            self._update_review_heatmap(data)
+            self._update_review_spectrum(data)
         elif active_tab == 2:
+            self._update_review_heatmap(data)
+        elif active_tab == 3:
             self._update_review_surface(data)
         else:
             self._update_review_time_plot(data)
@@ -1801,6 +2058,11 @@ class GaussMeterGUI(QMainWindow):
         ts_rel = ts - ts[0]
         field_key = primary_field_name(data)
         self._review_field_curve.setData(ts_rel, data[field_key])
+        values = np.asarray(data[field_key], dtype=float)
+        self._review_cursor_data = (np.asarray(ts_rel, dtype=float), values)
+        finite = values[np.isfinite(values)]
+        if finite.size and self._review_mean_line is not None:
+            self._review_mean_line.setPos(float(np.mean(finite)))
 
         if self._review_show_freq_cb.isChecked() and "freq_hz" in (data.dtype.names or ()):
             self._review_freq_curve.setData(ts_rel, data["freq_hz"])
@@ -1817,6 +2079,15 @@ class GaussMeterGUI(QMainWindow):
             self._review_region.blockSignals(True)
             self._review_region.setRegion((float(ts_rel[0]), float(ts_rel[-1])))
             self._review_region.blockSignals(False)
+            if self._review_cursor_a is not None and self._review_cursor_b is not None:
+                self._review_cursor_a.blockSignals(True)
+                self._review_cursor_b.blockSignals(True)
+                self._review_cursor_a.setPos(float(ts_rel[0]))
+                self._review_cursor_b.setPos(float(ts_rel[-1]))
+                self._review_cursor_a.blockSignals(False)
+                self._review_cursor_b.blockSignals(False)
+        self._update_review_cursor_readout()
+        self._update_review_peak_markers()
 
         if self._review_auto_axis_cb.isChecked():
             self._review_plot_widget.autoRange()
@@ -1832,6 +2103,29 @@ class GaussMeterGUI(QMainWindow):
                     self._review_plot_widget.setYRange(y_min, y_max, padding=0)
             except ValueError:
                 self._review_plot_widget.autoRange()
+
+    def _update_review_spectrum(self, data: np.ndarray) -> None:
+        if self._review_spectrum_curve is None:
+            return
+        field_key = primary_field_name(data)
+        ts = data["timestamp_s"]
+        spectrum = analyze_spectrum(ts, data[field_key])
+        if not spectrum.get("ok"):
+            self._review_spectrum_curve.clear()
+            if self._review_spectrum_status is not None:
+                self._review_spectrum_status.setText(str(spectrum.get("reason", "无法计算频谱")))
+            return
+        self._review_spectrum_curve.setData(spectrum["frequencies"], spectrum["amplitudes"])
+        peaks = spectrum.get("peaks", [])
+        peak_text = ", ".join(
+            f"{p['frequency_hz']:.3g} Hz/{p['amplitude']:.3g}" for p in peaks[:3]
+        ) or "--"
+        if self._review_spectrum_status is not None:
+            self._review_spectrum_status.setText(
+                f"主频 {spectrum['dominant_frequency_hz']:.6g} Hz；"
+                f"分辨率 {spectrum['resolution_hz']:.6g} Hz；"
+                f"采样率 {spectrum['sample_rate_hz']:.6g} Hz；RMS {spectrum['rms']:.6g}；峰值 {peak_text}"
+            )
 
     def _update_review_heatmap(self, data: Optional[np.ndarray]) -> None:
         if not _HAS_PYG or self._review_heatmap_item is None:
@@ -1895,8 +2189,18 @@ class GaussMeterGUI(QMainWindow):
             if finite_values.size:
                 value_range = f"，范围 {float(finite_values.min()):.6g}..{float(finite_values.max()):.6g}"
             mode_label = "插值" if self._review_heatmap_mode() == "interpolated" else "原始"
+            spatial_stats = analyze_spatial_grid(xs, ys, grid)
+            profile = extract_profile(xs, ys, grid, axis="x")
+            profile_text = ""
+            if profile.get("ok"):
+                profile_text = (
+                    f"，中心剖面 pk-pk {profile['peak_to_peak']:.6g}"
+                )
             self._review_heatmap_status.setText(
-                f"{mode_label} {len(xs)} × {len(ys)} 网格，{finite_count} 个有效格，值: {value_key}{value_range}"
+                f"{mode_label} {len(xs)} × {len(ys)} 网格，{finite_count} 个有效格，值: {value_key}{value_range}；"
+                f"均匀性 {spatial_stats['uniformity_pct']:.3g}%；"
+                f"热点 ({spatial_stats['hotspot'][0]:.3g}, {spatial_stats['hotspot'][1]:.3g})"
+                f"{profile_text}"
             )
         if self._review_heatmap_widget is not None:
             self._review_heatmap_widget.autoRange()
@@ -2156,6 +2460,10 @@ class GaussMeterGUI(QMainWindow):
             self._review_stat_min.setText("--")
             self._review_stat_max.setText("--")
             self._review_stat_mean.setText("--")
+            self._review_stat_rms.setText("--")
+            self._review_stat_std.setText("--")
+            self._review_stat_pkpk.setText("--")
+            self._review_stat_sample_rate.setText("--")
             self._review_stat_channels.setText("")
             return
         summary = get_review_summary(data)
@@ -2164,6 +2472,9 @@ class GaussMeterGUI(QMainWindow):
         self._review_stat_min.setText(f"{summary['field_min']:.6f}")
         self._review_stat_max.setText(f"{summary['field_max']:.6f}")
         self._review_stat_mean.setText(f"{summary['field_mean']:.6f}")
+        self._review_stat_rms.setText(f"{summary.get('field_rms', 0.0):.6f} / {summary.get('field_std', 0.0):.6f}")
+        self._review_stat_pkpk.setText(f"{summary.get('field_peak_to_peak', 0.0):.6f}")
+        self._review_stat_sample_rate.setText(f"{summary.get('sample_rate_hz', 0.0):.3f} Hz")
 
         # 多通道统计摘要
         ch_lines = []
@@ -2172,7 +2483,7 @@ class GaussMeterGUI(QMainWindow):
                 continue
             label = {"field_x": "X", "field_y": "Y", "field_z": "Z", "field_total": "Total"}.get(ch_name, ch_name)
             ch_lines.append(
-                f"{label}: min={ch_stats['min']:.4f} max={ch_stats['max']:.4f} mean={ch_stats['mean']:.4f}"
+                f"{label}: min={ch_stats['min']:.4f} max={ch_stats['max']:.4f} rms={ch_stats.get('rms', 0.0):.4f} pkpk={ch_stats.get('peak_to_peak', 0.0):.4f}"
             )
         if ch_lines:
             self._review_stat_channels.setText(" | ".join(ch_lines))
@@ -2574,6 +2885,18 @@ class GaussMeterGUI(QMainWindow):
             return latest.get("field_z_mt", 0.0)
         return latest.get("field_total_mt", latest.get("field_mt", latest.get("field_x_mt", 0.0)))
 
+    def _threshold_buffer_channel(self) -> str:
+        """将阈值通道配置映射到实时缓冲区通道名。"""
+        key = self._threshold_channel_key()
+        channels = self._buffer.get_channels()
+        if key == "field_x":
+            return "field_x_mt" if "field_x_mt" in channels else "field_mt"
+        if key == "field_y":
+            return "field_y_mt"
+        if key == "field_z":
+            return "field_z_mt"
+        return "field_total_mt" if "field_total_mt" in channels else "field_mt"
+
     def _on_threshold_channel_changed(self) -> None:
         self._cfg.setdefault("acquisition", {})["threshold_channel"] = self._threshold_channel_key()
         save_config(self._cfg)
@@ -2644,10 +2967,8 @@ class GaussMeterGUI(QMainWindow):
 
         # 更新实时数据表格列
         columns = self._get_table_columns(new_model)
-        self._data_table.clearContents()
-        self._data_table.setRowCount(0)
-        self._data_table.setColumnCount(len(columns))
-        self._data_table.setHorizontalHeaderLabels(columns)
+        self._pending_live_table_rows.clear()
+        self._live_table_model.set_columns(columns)
 
         # 重新初始化环形缓冲区通道
         self._reinit_buffer_for_model(new_model)
@@ -2859,32 +3180,16 @@ class GaussMeterGUI(QMainWindow):
     def _on_clear_data_table(self) -> None:
         """清空实时数据表格。"""
         self._pending_live_table_rows.clear()
-        self._data_table.setRowCount(0)
+        self._live_table_model.clear()
         self.log("[GUI] 数据表格已清空")
 
     def _flush_live_table_rows(self) -> None:
-        if not self._pending_live_table_rows or not self._data_table.isVisible():
+        if not self._pending_live_table_rows:
             return
         rows = self._pending_live_table_rows
         self._pending_live_table_rows = []
         max_rows = self._table_max_rows_spin.value()
-        if len(rows) >= max_rows:
-            rows = rows[-max_rows:]
-            self._data_table.setRowCount(0)
-
-        self._data_table.setUpdatesEnabled(False)
-        try:
-            overflow = self._data_table.rowCount() + len(rows) - max_rows
-            if overflow > 0:
-                for _ in range(min(overflow, self._data_table.rowCount())):
-                    self._data_table.removeRow(0)
-            for values in rows:
-                row = self._data_table.rowCount()
-                self._data_table.insertRow(row)
-                for col_idx, value in enumerate(values):
-                    self._data_table.setItem(row, col_idx, QTableWidgetItem(value))
-        finally:
-            self._data_table.setUpdatesEnabled(True)
+        self._live_table_model.append_rows(rows, max_rows)
         self._data_table.scrollToBottom()
 
     def _on_clear_chart(self) -> None:
@@ -3031,6 +3336,7 @@ class GaussMeterGUI(QMainWindow):
     def _on_stop_stream(self) -> None:
         if self._cmd_service is None:
             return
+        self._finalize_pending_trigger_events()
         self._cmd_service.stop_acquisition()
         self._stream_start_btn.setEnabled(True)
         self._stream_stop_btn.setEnabled(False)
@@ -3097,6 +3403,7 @@ class GaussMeterGUI(QMainWindow):
 
     def _on_stop_recording(self) -> None:
         self._rec_stats_timer.stop()
+        self._finalize_pending_trigger_events()
         if self._recorder:
             self._recorder.stop()
             row_count = self._recorder.row_count
@@ -3346,6 +3653,9 @@ class GaussMeterGUI(QMainWindow):
             self._update_live_display(latest, mode, dec)
 
         self._total_points += len(points)
+        first_sequence = self._total_points - len(points) + 1
+        for i, p in enumerate(points):
+            p["_sequence"] = first_sequence + i
 
         # 推入环形缓冲区 (图表用)
         timestamps = [p.get("timestamp_s", 0.0) for p in points]
@@ -3353,15 +3663,15 @@ class GaussMeterGUI(QMainWindow):
         for ch in self._buffer.get_channels():
             buffer_data[ch] = [p.get(ch, 0.0) for p in points]
         self._buffer.extend(buffer_data, timestamps)
+        self._process_trigger_points(points)
 
         # 更新实时数据表格
-        if self._data_table.isVisible():
-            for i, p in enumerate(points):
-                sequence = self._total_points - len(points) + i + 1
-                self._pending_live_table_rows.append(self._live_table_row_values(sequence, p))
-            max_pending = max(self._table_max_rows_spin.value() * 2, 1000)
-            if len(self._pending_live_table_rows) > max_pending:
-                self._pending_live_table_rows = self._pending_live_table_rows[-max_pending:]
+        for i, p in enumerate(points):
+            sequence = int(p.get("_sequence", first_sequence + i))
+            self._pending_live_table_rows.append(self._live_table_row_values(sequence, p))
+        max_pending = max(self._table_max_rows_spin.value() * 2, 1000)
+        if len(self._pending_live_table_rows) > max_pending:
+            self._pending_live_table_rows = self._pending_live_table_rows[-max_pending:]
 
         # CSV 记录 (使用 CH1600Recorder)
         if self._recorder and self._recorder.is_recording:
@@ -3373,7 +3683,7 @@ class GaussMeterGUI(QMainWindow):
         # SQLite session store (query/review/provenance)
         if self._db_store is not None and self._db_session_id is not None:
             try:
-                first_seq = self._total_points - len(points) + 1
+                first_seq = first_sequence
                 db_points = []
                 raw_frames = []
                 for i, p in enumerate(points):
@@ -3469,16 +3779,30 @@ class GaussMeterGUI(QMainWindow):
         mode = self._get_active_acq_mode()
         ds = mode["downsample"]
         x_window = mode["x_window_s"]
-        max_pts = self._cfg.get("ui", {}).get("chart_history_points", 5000) // ds
+        max_pts = int(self._cfg.get("ui", {}).get("chart_history_points", 5000) or 5000)
 
         # 图表更新 — 暂停时跳过
         if not self._display_paused:
             # 主磁场曲线 (Total B)
             total_ch = "field_mt" if "field_mt" in self._buffer.get_channels() else "field_total_mt"
+            raw_ts_arr, raw_vals = self._buffer.get(total_ch, max_points=max_pts, downsample=1)
             ts_arr, vals = self._buffer.get(total_ch, max_points=max_pts, downsample=ds)
             if len(ts_arr) > 0:
                 ts_rel = ts_arr - ts_arr[-1]  # 相对时间 (秒)
                 self._field_curve.setData(ts_rel, vals)
+                self._live_cursor_data = (np.asarray(ts_rel, dtype=float), np.asarray(vals, dtype=float))
+                raw_ts_rel = raw_ts_arr - raw_ts_arr[-1] if len(raw_ts_arr) > 0 else ts_rel
+                metric_vals = raw_vals if len(raw_vals) > 0 else vals
+                analysis = analyze_time_series(raw_ts_rel, metric_vals)
+                self._last_live_analysis[total_ch] = analysis
+                if hasattr(self, "_live_mean_line"):
+                    self._live_mean_line.setPos(analysis["mean"])
+                    self._live_mean_line.setVisible(True)
+                self._update_live_measurements(raw_ts_rel, metric_vals, total_ch)
+                self._update_live_reference_lines()
+                self._update_live_cursor_readout()
+                self._update_live_peak_markers()
+                self._update_trigger_markers(float(ts_arr[-1]))
 
                 # 多通道分量曲线
                 if "field_x_mt" in self._buffer.get_channels():
@@ -3527,6 +3851,443 @@ class GaussMeterGUI(QMainWindow):
         if hasattr(self, '_freq_curve'):
             self._freq_curve.setVisible(visible)
 
+    def _format_metric_value(self, value: float, *, unit: str = "", precision: int = 4) -> str:
+        if not np.isfinite(value):
+            return "--"
+        suffix = f" {unit}" if unit else ""
+        return f"{value:.{precision}g}{suffix}"
+
+    def _update_live_measurements(self, ts_rel: np.ndarray, vals: np.ndarray, total_ch: str) -> None:
+        if not hasattr(self, "_live_metric_labels"):
+            return
+        unit = self._display_unit
+        scale = self._UNIT_CONVERSION.get(unit, 1.0)
+        analysis = analyze_time_series(ts_rel, vals * scale)
+        self._live_metric_labels["current"].setText(self._format_metric_value(analysis["current"], unit=unit))
+        self._live_metric_labels["min"].setText(self._format_metric_value(analysis["min"], unit=unit))
+        self._live_metric_labels["max"].setText(self._format_metric_value(analysis["max"], unit=unit))
+        self._live_metric_labels["peak_to_peak"].setText(self._format_metric_value(analysis["peak_to_peak"], unit=unit))
+        self._live_metric_labels["rms"].setText(self._format_metric_value(analysis["rms"], unit=unit))
+        self._live_metric_labels["std"].setText(self._format_metric_value(analysis["std"], unit=unit))
+        self._live_metric_labels["sample_rate_hz"].setText(self._format_metric_value(analysis["sample_rate_hz"], unit="Hz"))
+        self._live_metric_labels["duration_s"].setText(self._format_metric_value(analysis["duration_s"], unit="s"))
+        try:
+            low = float(self._low_thresh_edit.text())
+            high = float(self._up_thresh_edit.text())
+            threshold_ch = self._threshold_buffer_channel()
+            if threshold_ch == total_ch:
+                threshold_ts = ts_rel
+                threshold_vals = vals
+            elif threshold_ch in self._buffer.get_channels():
+                threshold_ts_abs, threshold_vals = self._buffer.get(
+                    threshold_ch, max_points=len(vals), downsample=1
+                )
+                threshold_ts = threshold_ts_abs - threshold_ts_abs[-1] if len(threshold_ts_abs) else threshold_ts_abs
+            else:
+                threshold_ts = np.array([])
+                threshold_vals = np.array([])
+            thresh = analyze_threshold_events(
+                threshold_ts,
+                threshold_vals,
+                low=low,
+                high=high,
+                absolute=self._judge_abs_cb.isChecked(),
+                mode="open" if self._judge_mode_combo.currentIndex() == 1 else "closed",
+            )
+            if thresh.get("enabled"):
+                self._live_metric_labels["threshold"].setText(
+                    f"NG {thresh['ng_count']} / {thresh['event_count']} 次"
+                )
+            else:
+                self._live_metric_labels["threshold"].setText("--")
+        except ValueError:
+            self._live_metric_labels["threshold"].setText("--")
+        channels = self._buffer.get_channels()
+        if "field_x_mt" in channels and "field_y_mt" in channels:
+            _, vx = self._buffer.get("field_x_mt", max_points=len(vals), downsample=1)
+            _, vy = self._buffer.get("field_y_mt", max_points=len(vals), downsample=1)
+            vz = None
+            if "field_z_mt" in channels:
+                _, vz_arr = self._buffer.get("field_z_mt", max_points=len(vals), downsample=1)
+                vz = vz_arr
+            vector = analyze_vector_components(vx, vy, vz)
+            self._live_metric_labels["vector"].setText(
+                f"XY {vector['direction_xy_deg']:.1f}° / σ {vector['direction_std_deg']:.1f}°"
+            )
+        else:
+            self._live_metric_labels["vector"].setText("--")
+
+    def _update_live_reference_lines(self) -> None:
+        if not hasattr(self, "_live_thresh_low_line"):
+            return
+        try:
+            low = float(self._low_thresh_edit.text())
+            high = float(self._up_thresh_edit.text())
+        except ValueError:
+            low = high = 0.0
+        enabled = not (low == 0.0 and high == 0.0)
+        self._live_thresh_low_line.setVisible(enabled)
+        self._live_thresh_high_line.setVisible(enabled)
+        if enabled:
+            self._live_thresh_low_line.setPos(low)
+            self._live_thresh_high_line.setPos(high)
+
+    def _on_toggle_live_cursors(self, visible: bool) -> None:
+        for item in (getattr(self, "_live_cursor_a", None), getattr(self, "_live_cursor_b", None), getattr(self, "_live_cursor_label", None)):
+            if item is not None:
+                item.setVisible(visible)
+        self._update_live_cursor_readout()
+
+    def _on_toggle_review_cursors(self, visible: bool) -> None:
+        for item in (getattr(self, "_review_cursor_a", None), getattr(self, "_review_cursor_b", None), getattr(self, "_review_cursor_label", None)):
+            if item is not None:
+                item.setVisible(visible)
+        self._update_review_cursor_readout()
+
+    def _cursor_text(self, cursor_a, cursor_b, data_pair: Tuple[np.ndarray, np.ndarray]) -> Tuple[str, float, float]:
+        xs, ys = data_pair
+        if xs.size == 0 or ys.size == 0:
+            return "", 0.0, 0.0
+        x1 = float(cursor_a.value())
+        x2 = float(cursor_b.value())
+        order = np.argsort(xs)
+        sx = xs[order]
+        sy = ys[order]
+        y1 = float(np.interp(x1, sx, sy))
+        y2 = float(np.interp(x2, sx, sy))
+        text = f"t1={x1:.3f}s t2={x2:.3f}s Δt={abs(x2-x1):.3f}s\nY1={y1:.6g} Y2={y2:.6g} ΔY={y2-y1:.6g}"
+        return text, min(x1, x2), max(y1, y2)
+
+    def _update_live_cursor_readout(self) -> None:
+        if not getattr(self, "_live_cursor_cb", None) or not self._live_cursor_cb.isChecked():
+            return
+        if getattr(self, "_live_cursor_label", None) is None:
+            return
+        text, x, y = self._cursor_text(self._live_cursor_a, self._live_cursor_b, self._live_cursor_data)
+        self._live_cursor_label.setText(text)
+        self._live_cursor_label.setPos(x, y)
+
+    def _update_review_cursor_readout(self) -> None:
+        if not getattr(self, "_review_cursor_cb", None) or not self._review_cursor_cb.isChecked():
+            return
+        if getattr(self, "_review_cursor_label", None) is None:
+            return
+        text, x, y = self._cursor_text(self._review_cursor_a, self._review_cursor_b, self._review_cursor_data)
+        self._review_cursor_label.setText(text)
+        self._review_cursor_label.setPos(x, y)
+
+    def _clear_peak_labels(self, plot_widget, labels: list) -> None:
+        while labels:
+            item = labels.pop()
+            try:
+                plot_widget.removeItem(item)
+            except Exception:
+                pass
+
+    def _add_peak_labels(self, plot_widget, labels: list, xs: np.ndarray, ys: np.ndarray) -> None:
+        finite = np.isfinite(xs) & np.isfinite(ys)
+        if not np.any(finite):
+            return
+        xs = xs[finite]
+        ys = ys[finite]
+        for idx, name in ((int(np.argmax(ys)), "MAX"), (int(np.argmin(ys)), "MIN")):
+            item = pg.TextItem(f"{name}\n{ys[idx]:.6g}", color="#ffaa00", anchor=(0.5, 1.0))
+            item.setPos(float(xs[idx]), float(ys[idx]))
+            plot_widget.addItem(item)
+            labels.append(item)
+
+    def _update_live_peak_markers(self) -> None:
+        if not _HAS_PYG or not hasattr(self, "_live_peak_labels"):
+            return
+        self._clear_peak_labels(self._plot_widget, self._live_peak_labels)
+        if not getattr(self, "_live_peaks_cb", None) or not self._live_peaks_cb.isChecked():
+            return
+        xs, ys = self._live_cursor_data
+        self._add_peak_labels(self._plot_widget, self._live_peak_labels, xs, ys)
+
+    def _update_review_peak_markers(self) -> None:
+        if not _HAS_PYG or not hasattr(self, "_review_peak_labels"):
+            return
+        self._clear_peak_labels(self._review_plot_widget, self._review_peak_labels)
+        if not getattr(self, "_review_peaks_cb", None) or not self._review_peaks_cb.isChecked():
+            return
+        xs, ys = self._review_cursor_data
+        self._add_peak_labels(self._review_plot_widget, self._review_peak_labels, xs, ys)
+
+    def _on_trigger_enabled_changed(self, checked: bool) -> None:
+        self._trigger_armed = checked
+        self._trigger_prev_value = None
+        self._trigger_prev_threshold_ng = None
+        self._update_trigger_status()
+
+    def _arm_trigger(self) -> None:
+        self._trigger_armed = True
+        self._trigger_prev_value = None
+        self._trigger_prev_threshold_ng = None
+        if hasattr(self, "_trigger_enabled_cb"):
+            self._trigger_enabled_cb.setChecked(True)
+        self._update_trigger_status()
+
+    def _clear_trigger_events(self) -> None:
+        self._trigger_events.clear()
+        self._trigger_pending_events.clear()
+        self._trigger_pre_points.clear()
+        self._trigger_prev_threshold_ng = None
+        if hasattr(self, "_trigger_marker_item"):
+            self._trigger_marker_item.setData([], [])
+        if hasattr(self, "_trigger_event_table"):
+            self._trigger_event_table.setRowCount(0)
+        self._update_trigger_status()
+        self.log("[GUI] 触发事件已清空")
+
+    def _trigger_point_value(self, point: Dict[str, float]) -> float:
+        return self._threshold_value_from_latest(point)
+
+    def _point_is_threshold_ng(self, point: Dict[str, float]) -> bool:
+        try:
+            up = float(self._up_thresh_edit.text())
+            low = float(self._low_thresh_edit.text())
+        except ValueError:
+            return False
+        if up == 0.0 and low == 0.0:
+            return False
+        value = self._trigger_point_value(point)
+        if self._judge_abs_cb.isChecked():
+            value = abs(value)
+            low = abs(low)
+            up = abs(up)
+        if low > up:
+            low, up = up, low
+        in_range = low <= value <= up
+        return in_range if self._judge_mode_combo.currentIndex() == 1 else not in_range
+
+    def _process_trigger_points(self, points: List[Dict[str, float]]) -> None:
+        if not hasattr(self, "_trigger_enabled_cb"):
+            return
+        pre_limit = int(self._trigger_pre_spin.value()) if hasattr(self, "_trigger_pre_spin") else 50
+        post_limit = int(self._trigger_post_spin.value()) if hasattr(self, "_trigger_post_spin") else 50
+        mode = self._trigger_mode_combo.currentData()
+        try:
+            level = float(self._trigger_level_edit.text() or 0.0)
+        except ValueError:
+            level = 0.0
+        for point in points:
+            compact = self._compact_trigger_point(point)
+            self._extend_pending_trigger_events(compact)
+            if not self._trigger_enabled_cb.isChecked() or not self._trigger_armed:
+                self._append_trigger_pre_point(compact, pre_limit)
+                continue
+            value = self._trigger_point_value(point)
+            triggered = False
+            if mode == "threshold":
+                is_ng = self._point_is_threshold_ng(point)
+                triggered = is_ng and self._trigger_prev_threshold_ng is not True
+                self._trigger_prev_threshold_ng = is_ng
+            elif mode == "rising" and self._trigger_prev_value is not None:
+                triggered = self._trigger_prev_value < level <= value
+            elif mode == "falling" and self._trigger_prev_value is not None:
+                triggered = self._trigger_prev_value > level >= value
+            self._trigger_prev_value = value
+            if not triggered:
+                self._append_trigger_pre_point(compact, pre_limit)
+                continue
+            sequence = int(point.get("_sequence", self._total_points))
+            event = {
+                "id": self._trigger_next_event_id,
+                "timestamp_s": float(point.get("timestamp_s", 0.0)),
+                "value": float(value),
+                "mode": str(mode),
+                "sequence": sequence,
+                "channel": self._threshold_channel_key(),
+                "level": level if mode in {"rising", "falling"} else None,
+                "window_points": list(self._trigger_pre_points) + [compact],
+                "pre_points": len(self._trigger_pre_points),
+                "post_points": 0,
+                "post_remaining": post_limit,
+                "db_id": None,
+            }
+            self._trigger_next_event_id += 1
+            self._trigger_events.append(event)
+            if len(self._trigger_events) > self._trigger_max_events:
+                self._trigger_events = self._trigger_events[-self._trigger_max_events:]
+            if post_limit > 0:
+                self._trigger_pending_events.append(event)
+            else:
+                self._finalize_trigger_event(event)
+            self.log(
+                f"[TRIGGER] {event['mode']} t={event['timestamp_s']:.6f}s value={event['value']:.6g}"
+            )
+            if self._trigger_single_cb.isChecked():
+                self._trigger_armed = False
+            self._append_trigger_pre_point(compact, pre_limit)
+        self._update_trigger_status()
+        self._update_trigger_event_table()
+
+    def _compact_trigger_point(self, point: Dict[str, float]) -> Dict[str, float]:
+        keys = (
+            "_sequence", "timestamp_s", "field_mt", "field_x_mt", "field_y_mt", "field_z_mt",
+            "field_total_mt", "freq_hz", "temp_c",
+        )
+        compact: Dict[str, float] = {}
+        for key in keys:
+            if key in point:
+                try:
+                    compact[key] = float(point[key])
+                except (TypeError, ValueError):
+                    pass
+        return compact
+
+    def _append_trigger_pre_point(self, point: Dict[str, float], limit: int) -> None:
+        if limit <= 0:
+            self._trigger_pre_points = []
+            return
+        self._trigger_pre_points.append(dict(point))
+        if len(self._trigger_pre_points) > limit:
+            self._trigger_pre_points = self._trigger_pre_points[-limit:]
+
+    def _extend_pending_trigger_events(self, point: Dict[str, float]) -> None:
+        if not self._trigger_pending_events:
+            return
+        remaining_events = []
+        for event in self._trigger_pending_events:
+            if int(event.get("post_remaining", 0)) <= 0:
+                self._finalize_trigger_event(event)
+                continue
+            event.setdefault("window_points", []).append(dict(point))
+            event["post_remaining"] = int(event.get("post_remaining", 0)) - 1
+            event["post_points"] = int(event.get("post_points", 0)) + 1
+            if int(event.get("post_remaining", 0)) <= 0:
+                self._finalize_trigger_event(event)
+            else:
+                remaining_events.append(event)
+        self._trigger_pending_events = remaining_events
+
+    def _finalize_pending_trigger_events(self) -> None:
+        if not self._trigger_pending_events:
+            return
+        for event in list(self._trigger_pending_events):
+            self._finalize_trigger_event(event)
+        self._trigger_pending_events.clear()
+        self._update_trigger_event_table()
+
+    def _finalize_trigger_event(self, event: Dict[str, Any]) -> None:
+        if event.get("db_id") is not None:
+            return
+        if self._db_store is None:
+            event["db_id"] = ""
+            return
+        try:
+            event["db_id"] = self._db_store.append_trigger_event(
+                session_id=self._db_session_id,
+                timestamp_s=float(event.get("timestamp_s", 0.0)),
+                value=float(event.get("value", 0.0)),
+                channel=str(event.get("channel", self._threshold_channel_key())),
+                mode=str(event.get("mode", "")),
+                sequence=int(event.get("sequence", 0)),
+                level=event.get("level"),
+                pre_points=int(event.get("pre_points", 0)),
+                post_points=int(event.get("post_points", 0)),
+                window_points=list(event.get("window_points", [])),
+            )
+        except Exception as exc:
+            event["db_id"] = ""
+            self.log(f"[DB] 保存触发事件失败: {exc}")
+
+    def _update_trigger_event_table(self) -> None:
+        if not hasattr(self, "_trigger_event_table"):
+            return
+        rows = self._trigger_events[-20:]
+        self._trigger_event_table.setRowCount(len(rows))
+        for row_idx, event in enumerate(rows):
+            values = [
+                str(event.get("id", row_idx + 1)),
+                f"{float(event.get('timestamp_s', 0.0)):.6f}",
+                str(event.get("mode", "")),
+                f"{float(event.get('value', 0.0)):.6g}",
+                str(len(event.get("window_points", []))),
+                str(event.get("db_id", "")),
+            ]
+            for col_idx, value in enumerate(values):
+                self._trigger_event_table.setItem(row_idx, col_idx, QTableWidgetItem(value))
+        self._trigger_event_table.scrollToBottom()
+
+    def _selected_trigger_event(self) -> Optional[Dict[str, Any]]:
+        if not hasattr(self, "_trigger_event_table") or not self._trigger_events:
+            return self._trigger_events[-1] if self._trigger_events else None
+        selected = self._trigger_event_table.selectionModel().selectedRows()
+        if not selected:
+            return self._trigger_events[-1]
+        visible_rows = self._trigger_events[-20:]
+        row = selected[0].row()
+        if 0 <= row < len(visible_rows):
+            return visible_rows[row]
+        return self._trigger_events[-1]
+
+    def _on_trigger_event_selected(self) -> None:
+        event = self._selected_trigger_event()
+        if event:
+            self._trigger_status_label.setText(
+                f"Selected #{event.get('id')} | {event.get('mode')} "
+                f"t={float(event.get('timestamp_s', 0.0)):.6f}s | window {len(event.get('window_points', []))}"
+            )
+
+    def _replay_last_trigger_event(self) -> None:
+        event = self._selected_trigger_event()
+        if not event:
+            return
+        points = event.get("window_points", [])
+        if not points or not _HAS_PYG:
+            self.log("[TRIGGER] 当前事件没有可回放窗口")
+            return
+        ts = np.asarray([p.get("timestamp_s", 0.0) for p in points], dtype=float)
+        values = np.asarray([
+            p.get("field_total_mt", p.get("field_mt", p.get("field_x_mt", 0.0))) for p in points
+        ], dtype=float)
+        if ts.size == 0:
+            return
+        ts_rel = ts - float(event.get("timestamp_s", ts[0]))
+        self._display_paused = True
+        self._pause_btn.setChecked(True)
+        self._pause_btn.setText("恢复显示 / Resume")
+        self._field_curve.setData(ts_rel, values)
+        self._plot_widget.setXRange(float(np.min(ts_rel)), float(np.max(ts_rel)) if ts_rel.size > 1 else 1.0, padding=0.05)
+        if values.size:
+            margin = max(float(np.ptp(values)) * 0.1, 1e-6)
+            self._plot_widget.setYRange(float(np.min(values)) - margin, float(np.max(values)) + margin, padding=0)
+        self.log(f"[TRIGGER] 已回放事件 #{event.get('id')}")
+
+    def _update_trigger_status(self) -> None:
+        if not hasattr(self, "_trigger_status_label"):
+            return
+        if not self._trigger_enabled_cb.isChecked():
+            self._trigger_status_label.setText("未启用 / Disabled")
+            return
+        state = "ARMED" if self._trigger_armed else "HOLD"
+        last = self._trigger_events[-1] if self._trigger_events else None
+        if last:
+            self._trigger_status_label.setText(
+                f"{state} | 事件 {len(self._trigger_events)} | "
+                f"Last: {last['mode']} t={last['timestamp_s']:.6f}s value={last['value']:.6g}"
+            )
+        else:
+            self._trigger_status_label.setText(f"{state} | 等待触发 / Waiting")
+
+    def _update_trigger_markers(self, latest_timestamp: float) -> None:
+        if not hasattr(self, "_trigger_marker_item"):
+            return
+        if not self._trigger_events:
+            self._trigger_marker_item.setData([], [])
+            return
+        xs = []
+        ys = []
+        window = self._get_active_acq_mode().get("x_window_s", 5.0)
+        for event in self._trigger_events:
+            x = float(event["timestamp_s"]) - latest_timestamp
+            if -window <= x <= 0.5:
+                xs.append(x)
+                ys.append(float(event["value"]))
+        self._trigger_marker_item.setData(xs, ys)
+
     # ==================================================================
     # 日志
     # ==================================================================
@@ -3541,6 +4302,7 @@ class GaussMeterGUI(QMainWindow):
     # ==================================================================
 
     def closeEvent(self, event) -> None:
+        self._finalize_pending_trigger_events()
         if self._ctrl:
             try:
                 if self._ctrl.is_streaming and self._cmd_service:

@@ -21,6 +21,9 @@ env/
 # Experiments (runtime output)
 experiments/*.csv
 experiments/*.json
+experiments/*.sqlite3
+experiments/*.sqlite3-wal
+experiments/*.sqlite3-shm
 
 # OS files
 .DS_Store

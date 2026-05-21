@@ -60,6 +60,22 @@ class TestCH1600SQLiteStore(unittest.TestCase):
             selected = store.query_samples(session_id=session_id, sequence_start=2)
             sessions = store.list_sessions()
             raw_frames = store.raw_frame_count(session_id)
+            event_id = store.append_trigger_event(
+                session_id=session_id,
+                timestamp_s=1.25,
+                sequence=2,
+                channel="field_total",
+                mode="rising",
+                level=1.0,
+                value=2.5,
+                pre_points=1,
+                post_points=1,
+                window_points=[
+                    {"timestamp_s": 1.0, "field_total_mt": 0.5},
+                    {"timestamp_s": 1.25, "field_total_mt": 2.5},
+                ],
+            )
+            events = store.list_trigger_events(session_id=session_id)
             store.close()
 
             reopened = CH1600SQLiteStore(db_path)
@@ -76,6 +92,10 @@ class TestCH1600SQLiteStore(unittest.TestCase):
         self.assertEqual(sessions[0]["probe_profile"], "standard_hall")
         self.assertEqual(sessions[0]["sample_count"], 2)
         self.assertEqual(raw_frames, 2)
+        self.assertGreater(event_id, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["mode"], "rising")
+        self.assertIn("field_total_mt", events[0]["window_json"])
         self.assertEqual(len(reopened_data), 2)
 
     def test_reject_unknown_source(self):

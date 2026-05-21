@@ -9,11 +9,31 @@
     "stream_batch_size": 100,
     "stream_batch_interval_s": 0.03
   },
+  "device_model": "1d_gauss",
+  "probe_profile": "standard_hall",
   "acquisition": {
     "save_dir": "./experiments",
     "auto_save": false,
     "mode_key": "dc_normal",
-    "zero_offset": 0.0
+    "zero_offset": 0.0,
+    "zero_offsets": {},
+    "threshold_channel": "field_total",
+    "max_file_size_mb": 100,
+    "max_file_rows": 100000,
+    "rollover_strategy": "new_file"
+  },
+  "database": {
+    "path": "./experiments/m1600.sqlite3",
+    "enabled": true,
+    "store_raw_frames": true
+  },
+  "review": {
+    "default_source": "all",
+    "manual_axis_enabled": false,
+    "x_min_s": 0.0,
+    "x_max_s": 60.0,
+    "y_min": -1.0,
+    "y_max": 1.0
   },
   "monitor": {
     "interval_ms": 500
@@ -22,7 +42,19 @@
     "display_interval_ms": 30,
     "chart_history_points": 5000,
     "chart_downsample": 2,
+    "chart_colors": {
+      "field": "#0080c8",
+      "freq": "#00a651"
+    },
+    "chart_line_width": 2,
     "window_width": 1200,
     "window_height": 800
+  },
+  "external_ipc": {
+    "enabled": false,
+    "mode": "zmq",
+    "zmq_data_port": 5555,
+    "zmq_cmd_port": 5556,
+    "namedpipe_name": "m1600_control"
   }
 }

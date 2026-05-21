@@ -345,3 +345,42 @@ Todo：
 - `[ ]` CSV recorder 增加可配置 fsync 策略：默认 flush，实验室关键记录可开启周期性 fsync。
 - `[ ]` IPC 增加本机 ZMQ client smoke test；Windows 环境补 NamedPipe client smoke test。
 - `[ ]` PyVista/VTK renderer 继续保持 optional spike，只有在大网格性能和交互收益明确后再作为可选后端接入。
+
+## 9. 科研级数据呈现升级路线图
+
+> 2026-05-20 增量追加。目标是补齐和国外科研仪器/示波器软件相比的呈现短板：Lake Shore F71/F41 的 live plot、qualifier 和 peak hold；Metrolab THM1176/EZMag3D 的 RMS、peak-to-peak、频谱峰表和多视图；SENIS Mapper 的空间扫描摘要、热点/冷点和均匀性；Zurich LabOne / 示波器软件的游标、峰谷标注、频域和测量表。
+> 运行约束：依赖安装、自动化测试和正式运行默认在 conda 环境中执行。当前启动脚本沿用 `D:\anaconda3` 作为默认 conda base；系统 Python 只作为排障 fallback，不作为文档主路径。
+
+### 9.1 本轮已新增的基础能力
+
+- `[x]` 新增 `data/measurement_analysis.py`，统一计算实时/回看复用的 min/max/mean/std/RMS/peak-to-peak/abs peak/drift/slope/采样率/时长。
+- `[x]` 新增阈值事件统计：超限点数、事件数、超限占比和最长超限区间。
+- `[x]` 新增 2D/3D 矢量摘要：平均 Total B、XY 方向角、倾角、方向稳定性和分量占比。
+- `[x]` 新增回看频谱 v1：基于当前筛选数据做 NumPy FFT，显示主频、频率分辨率、采样率、RMS 和前几个频谱峰。
+- `[x]` 新增 `data/spatial_analysis.py`：空间网格 min/max/mean/std、均匀性、最大梯度、热点/冷点和中心剖面。
+- `[x]` 实时页新增 Measurements 面板，展示当前值、Min、Max、Pk-Pk、RMS、Std、实际采样率、窗口时长、阈值事件和矢量方向。
+- `[x]` 实时/回看时间曲线新增双游标、峰谷标注、均值线和阈值参考线。
+- `[x]` HTML 报告新增 RMS、Std、Pk-Pk、采样率、阈值事件摘要和空间扫描摘要。
+- `[x]` 新增实时触发捕获 v1：阈值 NG、上升沿、下降沿、Single/Arm、事件计数和曲线触发点标记。
+- `[x]` 触发事件增加预触发/后触发窗口、事件详情表、最后事件回放和 SQLite `trigger_events` 持久化。
+- `[x]` 实时表格迁移到 `QAbstractTableModel + QTableView`，替代高频场景下逐行 `insertRow/removeRow` 的 `QTableWidget` 更新。
+
+### 9.2 后续仍需推进
+
+- `[ ]` 实时 FFT/频谱瀑布图：当前只在回看页做 FFT，避免 200/300 Hz 采集时 GUI 线程负担过重。
+- `[~]` 触发捕获和历史回放：v1 已有阈值/边沿触发、Single/Arm、预/后触发缓存、事件表、SQLite 持久化和最后事件回放；仍缺跨 session 事件浏览器、事件导出和报告中的事件波形嵌入。
+- `[ ]` mask/pass-fail 区域：把阈值线扩展为时间窗和空间区域合格判定。
+- `[ ]` 参考波形/参考热图：支持当前采样和基准数据叠加比较。
+- `[ ]` 空间扫描高级判定：极宽、零交叉、磁角、角度误差、裂纹/异常区域检测，等待真实空间扫描样本后定义验收标准。
+- `[~]` 大数据性能成熟化：实时表格已模型化；实时测量面板、频谱、空间摘要仍需要在 200/300 Hz 长时间采集和百万行回看数据上压测。
+
+### 9.3 默认 conda 命令
+
+```bash
+conda activate <env-or-D:/anaconda3>
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-optional.txt
+python -m compileall app core data instruments workers tests
+python -m unittest discover -v
+python main.py
+```

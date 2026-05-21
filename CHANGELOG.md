@@ -10,6 +10,23 @@ agents.
 
 ### Added
 
+- **Scientific measurement presentation**
+  - Added `data/measurement_analysis.py` for shared live/review metrics: min/max/mean/std/RMS/peak-to-peak/abs peak/drift/slope/sample rate/duration.
+  - Added threshold event summaries with NG count, event count, NG ratio, and longest NG interval.
+  - Added vector summaries for 2D/3D probes: direction angle, inclination, direction stability, and component share.
+  - Added `data/spatial_analysis.py` for spatial min/max/mean/std, uniformity, gradient, hotspot/coldspot, and profile extraction.
+  - Live Data now includes a Measurements panel with current value, Min, Max, Pk-Pk, RMS, Std, actual sample rate, window duration, threshold events, and vector direction.
+  - Live and Review time plots now support dual cursors, peak/trough labels, mean reference line, and threshold reference lines.
+  - Added live trigger capture v1 with threshold-NG, rising-edge, falling-edge, Single/Arm state, event count, and trigger markers on the live plot.
+  - Trigger capture now stores pre/post-trigger replay windows, shows a compact event table, replays the selected/latest event on the live plot, and persists events to SQLite `trigger_events`.
+  - Replaced the live `QTableWidget` update path with a `QAbstractTableModel`/`QTableView` cache to reduce high-rate row insertion/removal overhead.
+  - Review Plots now include a Spectrum tab using NumPy FFT over the active review dataset/selection.
+  - HTML reports now include RMS, Std, Pk-Pk, sample rate, threshold event summary, and spatial scan summary.
+
+- **Conda-first workflow documentation**
+  - Roadmap now states that dependency installation, automated testing, and formal runtime are expected to use the conda environment by default.
+  - Default validation commands use `conda activate <env-or-D:/anaconda3>` followed by `python -m pip ...`, `compileall`, `unittest`, and `python main.py`.
+
 - **SQLite experiment store** (`data/sqlite_store.py`)
   - Added `sessions`, `samples`, `raw_frames`, and `exports` tables.
   - Added session lifecycle, sample append/query, raw frame traceability, and export provenance APIs.
